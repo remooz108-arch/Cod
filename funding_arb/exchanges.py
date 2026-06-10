@@ -66,6 +66,19 @@ def build_exchanges() -> dict[str, Any]:
         except Exception:
             exchanges["hyperliquid"] = ccxt.hyperliquid()
 
+    if config.MEXC_API_KEY:
+        exchanges["mexc"] = ccxt.mexc({
+            "apiKey": config.MEXC_API_KEY,
+            "secret": config.MEXC_SECRET,
+        })
+
+    if config.BITGET_API_KEY:
+        exchanges["bitget"] = ccxt.bitget({
+            "apiKey": config.BITGET_API_KEY,
+            "secret": config.BITGET_SECRET,
+            "password": config.BITGET_PASSPHRASE,
+        })
+
     # Read-only fallbacks for any exchange without credentials (rate scanning)
     fallbacks = [
         ("binance",     ccxt.binance),
@@ -73,6 +86,8 @@ def build_exchanges() -> dict[str, Any]:
         ("okx",         ccxt.okx),
         ("gateio",      ccxt.gateio),
         ("hyperliquid", ccxt.hyperliquid),
+        ("mexc",        ccxt.mexc),
+        ("bitget",      ccxt.bitget),
     ]
     for name, cls in fallbacks:
         if name not in exchanges:
@@ -158,7 +173,7 @@ def _extract_rate(
 ) -> Optional[FundingRate]:
     try:
         rate = float(info.get("fundingRate") or info.get("rate") or 0)
-        if rate <= 0:
+        if rate == 0:
             return None
         mark = float(info.get("markPrice") or info.get("mark") or 0)
         if config.MIN_MARK_PRICE and mark and mark < config.MIN_MARK_PRICE:
@@ -371,6 +386,44 @@ def close_perp_position_maker(ex: Any, perp_symbol: str, qty: float, fill_timeou
     except Exception:
         pass
     return close_perp_position(ex, perp_symbol, qty)
+
+
+def place_spot_short(ex: Any, base: str, usdc_amount: float) -> dict:
+    """Open a cross-margin short on spot for inverse funding harvesting."""
+    symbol = get_spot_symbol(ex.id, base)
+    ticker = ex.fetch_ticker(symbol)
+    price  = ticker["bid"]
+    qty    = ex.amount_to_precision(symbol, usdc_amount / price)
+    return ex.create_market_sell_order(
+        symbol, float(qty), params={"marginMode": "cross", "type": "margin"}
+    )
+
+
+def close_spot_short(ex: Any, base: str, qty: float) -> dict:
+    """Buy back to close a margin short position."""
+    symbol  = get_spot_symbol(ex.id, base)
+    qty_str = ex.amount_to_precision(symbol, qty)
+    return ex.create_market_buy_order(
+        symbol, float(qty_str), params={"marginMode": "cross", "type": "margin"}
+    )
+
+
+def place_perp_long(ex: Any, perp_symbol: str, usdc_amount: float) -> dict:
+    """Open a long perp to pair with a margin spot short."""
+    ticker = ex.fetch_ticker(perp_symbol)
+    price  = ticker["ask"]
+    qty    = ex.amount_to_precision(perp_symbol, usdc_amount / price)
+    return ex.create_market_buy_order(
+        perp_symbol, float(qty), params={"reduceOnly": False}
+    )
+
+
+def close_perp_long(ex: Any, perp_symbol: str, qty: float) -> dict:
+    """Close a long perp by selling with reduceOnly."""
+    qty_str = ex.amount_to_precision(perp_symbol, qty)
+    return ex.create_market_sell_order(
+        perp_symbol, float(qty_str), params={"reduceOnly": True}
+    )
 
 
 def fetch_margin_ratio(ex: Any, symbol: str) -> Optional[float]:

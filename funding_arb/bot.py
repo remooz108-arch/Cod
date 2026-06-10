@@ -48,13 +48,17 @@ from exchanges import (
     has_spot_market,
     place_spot_buy,
     place_spot_buy_maker,
+    place_spot_short,
     place_perp_short,
     place_perp_short_maker,
+    place_perp_long,
     set_leverage,
     close_spot_position,
     close_spot_position_maker,
+    close_spot_short,
     close_perp_position,
     close_perp_position_maker,
+    close_perp_long,
     get_spot_symbol,
     PERP_ONLY_EXCHANGES,
 )
@@ -296,6 +300,11 @@ def open_position(
 
     pos_size = risk.effective_position_size()
 
+    # Rate-proportional sizing: higher-quality rates get up to MAX_SIZE_MULTIPLIER × base.
+    if config.RATE_PROPORTIONAL_SIZING and config.MIN_FUNDING_RATE > 0:
+        multiplier = min(rate.rate_8h / config.MIN_FUNDING_RATE, config.MAX_SIZE_MULTIPLIER)
+        pos_size   = min(pos_size * multiplier, config.MAX_TOTAL_USDC / 3)
+
     # Balance-aware sizing (live only): size from real free balance so the bot
     # self-calibrates as capital grows. Never exceed the compounded size cap.
     if config.BALANCE_AWARE_SIZING and live:
@@ -357,8 +366,17 @@ def open_position(
             )
             return
 
+    # Cross-exchange arb: prefer a more-liquid exchange for the spot leg.
+    spot_ex_name = ex_name
+    if config.CROSS_EXCHANGE_ARB:
+        for preferred in config.SPOT_EXCHANGE_PREFERENCE:
+            if preferred != ex_name and preferred in exchanges:
+                if has_spot_market(exchanges[preferred], rate.base):
+                    spot_ex_name = preferred
+                    break
+
     half         = pos_size / 2
-    spot_symbol  = get_spot_symbol(ex_name, rate.base)
+    spot_symbol  = get_spot_symbol(spot_ex_name, rate.base)
     spot_qty     = half / rate.mark_price if rate.mark_price else 0
 
     compound_tag = (
@@ -377,16 +395,19 @@ def open_position(
         # from liquidation.  Silent no-op if the exchange doesn't support it.
         set_leverage(ex, rate.symbol, config.PERP_LEVERAGE)
 
-        maker = config.MAKER_ORDER_ENABLED
+        maker    = config.MAKER_ORDER_ENABLED
+        spot_ex  = exchanges[spot_ex_name]
+        cross    = spot_ex_name != ex_name
         try:
             sr = (
-                place_spot_buy_maker(ex, rate.base, half, config.MAKER_FILL_TIMEOUT)
-                if maker else place_spot_buy(ex, rate.base, half)
+                place_spot_buy_maker(spot_ex, rate.base, half, config.MAKER_FILL_TIMEOUT)
+                if maker else place_spot_buy(spot_ex, rate.base, half)
             )
             spot_order_id = sr.get("id")
             spot_qty    = float(sr.get("filled") or sr.get("amount") or spot_qty)
-            log(f"    Spot BUY  {spot_qty:.6f} {rate.base} "
-                f"(order {spot_order_id}){' [maker]' if maker else ''}")
+            log(f"    Spot BUY  {spot_qty:.6f} {rate.base} on {spot_ex_name} "
+                f"(order {spot_order_id})"
+                f"{' [maker]' if maker else ''}{' [cross-exchange]' if cross else ''}")
         except Exception as exc:
             log(f"    ERROR spot buy: {exc}")
             return
@@ -427,7 +448,7 @@ def open_position(
         base=rate.base,
         spot_symbol=spot_symbol,
         perp_symbol=rate.symbol,
-        spot_exchange=ex_name,
+        spot_exchange=spot_ex_name,
         spot_qty=spot_qty,
         perp_qty=spot_qty,
         entry_spot_price=rate.mark_price,
@@ -443,6 +464,117 @@ def open_position(
     risk.record_open(pos)
     log(f"  Position opened: {pos.id}  (${pos_size:.0f} USDC deployed)")
     notify.position_opened(ex_name, rate.base, pos_size, rate.rate_8h, rate.apy)
+
+
+# ── Inverse entry (negative funding harvesting) ───────────────────────────────
+
+def open_inverse_position(
+    ex_name: str, exchanges: dict, rate, risk: RiskManager, live: bool
+) -> None:
+    """Enter short-spot-margin + long-perp to harvest negative funding payments."""
+    if rate.perp_only:
+        return  # DEX — no margin spot available
+
+    pos_size = risk.effective_position_size()
+
+    # Rate-proportional sizing for inverse too
+    if config.RATE_PROPORTIONAL_SIZING and config.MIN_NEGATIVE_FUNDING_RATE > 0:
+        multiplier = min(
+            abs(rate.rate_8h) / config.MIN_NEGATIVE_FUNDING_RATE,
+            config.MAX_SIZE_MULTIPLIER,
+        )
+        pos_size = min(pos_size * multiplier, config.MAX_TOTAL_USDC / 3)
+
+    ok, reason = risk.can_open(ex_name, rate.base, size_override=pos_size, direction="short")
+    if not ok:
+        log(f"  Skip [inverse] {ex_name}:{rate.base} — {reason}")
+        return
+
+    ex = exchanges[ex_name]
+    if not has_spot_market(ex, rate.base):
+        log(f"  Skip [inverse] {ex_name}:{rate.base} — no spot market")
+        return
+
+    # Net-income check: daily funding income must exceed margin borrowing cost.
+    daily_income      = abs(rate.rate_8h) * 3 * pos_size
+    daily_margin_cost = config.MARGIN_INTEREST_RATE * (pos_size / 2)
+    if daily_income <= daily_margin_cost:
+        log(
+            f"  Skip [inverse] {ex_name}:{rate.base} — margin cost "
+            f"${daily_margin_cost:.4f}/day exceeds income ${daily_income:.4f}/day"
+        )
+        return
+
+    # Rate stability: require same N-scan confirmation as normal entries.
+    if not risk.is_rate_stable(ex_name, rate.base):
+        log(f"  Skip [inverse] {ex_name}:{rate.base} — awaiting stable scans")
+        return
+
+    half         = pos_size / 2
+    spot_symbol  = get_spot_symbol(ex_name, rate.base)
+    spot_qty     = half / rate.mark_price if rate.mark_price else 0
+
+    log(
+        f"  ENTERING [inverse] {rate.base} on {ex_name} | "
+        f"rate={rate.rate_8h:.4%}/8h  net ~${daily_income - daily_margin_cost:.4f}/day"
+    )
+
+    spot_order_id = perp_order_id = None
+
+    if live:
+        set_leverage(ex, rate.symbol, config.PERP_LEVERAGE)
+        try:
+            sr            = place_spot_short(ex, rate.base, half)
+            spot_order_id = sr.get("id")
+            spot_qty      = float(sr.get("filled") or sr.get("amount") or spot_qty)
+            log(f"    Spot SHORT (margin) {spot_qty:.6f} {rate.base} (order {spot_order_id})")
+        except Exception as exc:
+            log(f"    ERROR spot margin short: {exc}")
+            log(f"    Note: cross-margin trading must be enabled on {ex_name}")
+            return
+        try:
+            pr            = place_perp_long(ex, rate.symbol, half)
+            perp_order_id = pr.get("id")
+            log(f"    Perp LONG filled: {perp_order_id}")
+        except Exception as exc:
+            log(f"    ERROR perp long (spot already short — close manually!): {exc}")
+            return
+    else:
+        log(
+            f"    [dry-run] Would margin-short ${half:.2f} {rate.base} spot "
+            f"+ long ${half:.2f} {rate.symbol}"
+        )
+
+    mean, _, n = risk.rate_stats(ex_name, rate.base)
+    entry_note = (
+        f"INVERSE rate {rate.rate_8h:.4%}/8h; avg {mean:.4%} over {n} scans; "
+        f"size ${pos_size:.2f}; net ~${daily_income - daily_margin_cost:.4f}/day "
+        f"after margin cost"
+    )
+
+    pos = Position(
+        id=f"{ex_name}:{rate.base}",
+        exchange=ex_name,
+        base=rate.base,
+        spot_symbol=spot_symbol,
+        perp_symbol=rate.symbol,
+        spot_exchange=ex_name,
+        spot_qty=spot_qty,
+        perp_qty=spot_qty,
+        entry_spot_price=rate.mark_price,
+        entry_perp_price=rate.mark_price,
+        size_usdc=pos_size,
+        opened_at=datetime.now(timezone.utc),
+        last_rate_8h=rate.rate_8h,
+        peak_rate_8h=rate.rate_8h,
+        entry_note=entry_note,
+        spot_order_id=spot_order_id,
+        perp_order_id=perp_order_id,
+        direction="short",
+    )
+    risk.record_open(pos)
+    log(f"  Inverse position opened: {pos.id}  (${pos_size:.0f} USDC deployed)")
+    notify.position_opened(ex_name, rate.base, pos_size, rate.rate_8h, abs(rate.apy))
 
 
 # ── Exit ──────────────────────────────────────────────────────────────────────
@@ -464,26 +596,32 @@ def close_position(
                 f"Position remains open. Check your API keys.")
             return
 
-        maker = use_maker and config.MAKER_ORDER_ENABLED
+        maker = use_maker and config.MAKER_ORDER_ENABLED and pos.direction == "long"
         try:
-            if maker:
+            if pos.direction == "short":
+                close_spot_short(spot_ex, pos.base, pos.spot_qty)
+                log(f"    Spot BUY-BACK (margin) {pos.spot_qty:.6f} {pos.base} done")
+            elif maker:
                 close_spot_position_maker(spot_ex, pos.base, pos.spot_qty,
                                           config.MAKER_FILL_TIMEOUT)
+                log(f"    Spot SELL {pos.spot_qty:.6f} {pos.base} done [maker]")
             else:
                 close_spot_position(spot_ex, pos.base, pos.spot_qty)
-            log(f"    Spot SELL {pos.spot_qty:.6f} {pos.base} done"
-                f"{' (maker)' if maker else ''}")
+                log(f"    Spot SELL {pos.spot_qty:.6f} {pos.base} done")
         except Exception as exc:
             log(f"    ERROR closing spot: {exc}")
 
         try:
-            if maker:
+            if pos.direction == "short":
+                close_perp_long(perp_ex, pos.perp_symbol, pos.perp_qty)
+                log(f"    Perp SELL (close long) {pos.perp_qty:.6f} done")
+            elif maker:
                 close_perp_position_maker(perp_ex, pos.perp_symbol, pos.perp_qty,
                                           config.MAKER_FILL_TIMEOUT)
+                log(f"    Perp BUY-BACK {pos.perp_qty:.6f} done [maker]")
             else:
                 close_perp_position(perp_ex, pos.perp_symbol, pos.perp_qty)
-            log(f"    Perp BUY-BACK {pos.perp_qty:.6f} done"
-                f"{' (maker)' if maker else ''}")
+                log(f"    Perp BUY-BACK {pos.perp_qty:.6f} done")
         except Exception as exc:
             log(f"    ERROR closing perp: {exc}")
     else:
@@ -494,11 +632,11 @@ def close_position(
     notify.position_closed(pos.exchange, pos.base, reason, pos.funding_collected)
     _log_trade(pos, reason)
 
-    # Block re-entry of this asset for a cooldown window to prevent whipsawing.
-    risk.start_cooldown(pos.exchange, pos.base)
+    # Block re-entry on the same side for a cooldown window to prevent whipsawing.
+    risk.start_cooldown(pos.exchange, pos.base, pos.direction)
 
     # Circuit breaker: count rate-flip exits (not rotations or drift exits).
-    if "rate" in reason.lower() or "negative" in reason.lower() or "below" in reason.lower():
+    if any(w in reason.lower() for w in ("rate", "negative", "below", "positive")):
         risk.record_flip_exit()
 
 
@@ -596,6 +734,14 @@ def run(live: bool = False, no_ui: bool = False) -> None:
             try:
                 all_rates = fetch_all_funding_rates(exchanges)
                 top_rates = [r for r in all_rates if r.rate_8h > 0]
+                neg_rates = (
+                    sorted(
+                        [r for r in all_rates
+                         if r.rate_8h < -config.MIN_NEGATIVE_FUNDING_RATE],
+                        key=lambda r: r.rate_8h,  # most negative first
+                    )
+                    if config.NEGATIVE_FUNDING_ENABLED else []
+                )
             except Exception as exc:
                 log(f"Rate fetch error: {exc}")
                 time.sleep(config.SCAN_INTERVAL)
@@ -698,6 +844,16 @@ def run(live: bool = False, no_ui: bool = False) -> None:
                     if f"{rate.exchange}:{rate.base}" in open_ids:
                         continue
                     open_position(
+                        rate.exchange, exchanges, rate, risk,
+                        live=config.LIVE_TRADING,
+                    )
+                    risk.save_state()
+
+                # Inverse entries — negative funding harvesting
+                for rate in neg_rates:
+                    if f"{rate.exchange}:{rate.base}" in open_ids:
+                        continue
+                    open_inverse_position(
                         rate.exchange, exchanges, rate, risk,
                         live=config.LIVE_TRADING,
                     )

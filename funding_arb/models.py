@@ -44,8 +44,9 @@ class Position:
     spot_order_id: Optional[str] = None
     perp_order_id: Optional[str] = None
     last_period_at: Optional[datetime] = None  # tracks 8h funding window
-    peak_rate_8h: float = 0.0                  # highest rate seen since entry
+    peak_rate_8h: float = 0.0                  # highest (or most-negative) rate since entry
     entry_note: str = ""                       # human-readable entry thesis
+    direction: str = "long"                    # "long" = normal arb; "short" = inverse (neg funding)
 
     @property
     def apy_realised(self) -> float:

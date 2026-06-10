@@ -47,6 +47,7 @@ def _pos_to_dict(pos: Position) -> dict:
         "spot_order_id":     pos.spot_order_id,
         "perp_order_id":     pos.perp_order_id,
         "last_period_at":    pos.last_period_at.isoformat() if pos.last_period_at else None,
+        "direction":         pos.direction,
     }
 
 
@@ -80,6 +81,7 @@ def _pos_from_dict(d: dict) -> Position:
         spot_order_id    = d.get("spot_order_id"),
         perp_order_id    = d.get("perp_order_id"),
         last_period_at   = _parse_dt(d.get("last_period_at")),
+        direction        = d.get("direction", "long"),
     )
 
 
@@ -258,26 +260,30 @@ class RiskManager:
 
     # ── Cooldown guard ────────────────────────────────────────────────────────
 
-    def start_cooldown(self, exchange: str, base: str) -> None:
-        """Block re-entry of this asset for COOLDOWN_HOURS after an exit."""
+    def start_cooldown(self, exchange: str, base: str, direction: str = "long") -> None:
+        """Block re-entry on the same side for COOLDOWN_HOURS after an exit."""
         if not config.COOLDOWN_ENABLED or config.COOLDOWN_HOURS <= 0:
             return
         with self._lock:
-            self._cooldowns[f"{exchange}:{base}"] = (
+            self._cooldowns[f"{exchange}:{base}:{direction}"] = (
                 _utcnow() + timedelta(hours=config.COOLDOWN_HOURS)
             )
 
-    def in_cooldown(self, exchange: str, base: str) -> tuple[bool, float]:
-        """Return (is_cooling_down, minutes_remaining)."""
+    def in_cooldown(self, exchange: str, base: str, direction: str = "long") -> tuple[bool, float]:
+        """Return (is_cooling_down, minutes_remaining). Direction-aware."""
         if not config.COOLDOWN_ENABLED:
             return False, 0.0
         with self._lock:
-            until = self._cooldowns.get(f"{exchange}:{base}")
+            key   = f"{exchange}:{base}:{direction}"
+            until = self._cooldowns.get(key)
+            # Support old-format keys (no direction suffix) for state backward compat.
+            if until is None:
+                until = self._cooldowns.get(f"{exchange}:{base}")
             if until is None:
                 return False, 0.0
             now = _utcnow()
             if now >= until:
-                del self._cooldowns[f"{exchange}:{base}"]
+                self._cooldowns.pop(key, None)
                 return False, 0.0
             return True, (until - now).total_seconds() / 60.0
 
@@ -303,13 +309,15 @@ class RiskManager:
     # ── Gate ──────────────────────────────────────────────────────────────────
 
     def can_open(
-        self, exchange: str, base: str, size_override: Optional[float] = None
+        self, exchange: str, base: str,
+        size_override: Optional[float] = None,
+        direction: str = "long",
     ) -> tuple[bool, str]:
         with self._lock:
             pid = f"{exchange}:{base}"
             if pid in self._positions:
                 return False, f"Already have {pid} open"
-            cooling, mins = self.in_cooldown(exchange, base)
+            cooling, mins = self.in_cooldown(exchange, base, direction)
             if cooling:
                 return False, f"Cooldown: {base} re-entry blocked {mins:.0f}m more"
             if len(self._positions) >= config.MAX_POSITIONS:
@@ -360,6 +368,30 @@ class RiskManager:
     def should_exit(
         self, pos: Position, current_rate: Optional[float]
     ) -> tuple[bool, str]:
+        if pos.direction == "short":
+            # Inverse position: collecting negative funding. Exit when rate normalises.
+            if current_rate is not None and current_rate >= 0:
+                return True, f"Rate went positive ({current_rate:.4%}) — inverse exits"
+            if current_rate is not None and current_rate > -config.EXIT_FUNDING_RATE:
+                return True, (
+                    f"Rate {current_rate:.4%} no longer sufficiently negative "
+                    f"(exit threshold {-config.EXIT_FUNDING_RATE:.4%})"
+                )
+            if (
+                config.TRAILING_RATE_STOP > 0
+                and pos.peak_rate_8h < 0
+                and current_rate is not None
+            ):
+                # Recovery = how far rate has moved from most-negative toward zero
+                recovery = (current_rate - pos.peak_rate_8h) / abs(pos.peak_rate_8h)
+                if recovery >= config.TRAILING_RATE_STOP:
+                    return True, (
+                        f"Trailing stop: rate recovered {recovery:.0%} from peak "
+                        f"({pos.peak_rate_8h:.4%} → {current_rate:.4%}/8h)"
+                    )
+            return False, ""
+
+        # Normal (positive funding) position
         if current_rate is not None and current_rate < 0:
             return True, f"Rate went negative ({current_rate:.4%})"
         if current_rate is not None and current_rate < config.EXIT_FUNDING_RATE:
@@ -367,7 +399,6 @@ class RiskManager:
                 f"Rate {current_rate:.4%} below exit "
                 f"threshold {config.EXIT_FUNDING_RATE:.4%}"
             )
-        # Trailing rate stop: exit when rate has fallen too far from its peak.
         if (
             config.TRAILING_RATE_STOP > 0
             and pos.peak_rate_8h > 0
@@ -395,8 +426,13 @@ class RiskManager:
             if pos_id in self._positions:
                 p = self._positions[pos_id]
                 p.last_rate_8h = rate
-                if rate > p.peak_rate_8h:
-                    p.peak_rate_8h = rate
+                if p.direction == "short":
+                    # Inverse position: track the most-negative rate (most favourable)
+                    if rate < p.peak_rate_8h:
+                        p.peak_rate_8h = rate
+                else:
+                    if rate > p.peak_rate_8h:
+                        p.peak_rate_8h = rate
 
     def record_funding(
         self, pos_id: str, amount: float, rate: float, period_at: Optional[datetime] = None
@@ -409,8 +445,12 @@ class RiskManager:
                 p.funding_collected      += amount
                 p.funding_periods        += 1
                 p.last_rate_8h            = rate
-                if rate > p.peak_rate_8h:
-                    p.peak_rate_8h        = rate
+                if p.direction == "short":
+                    if rate < p.peak_rate_8h:
+                        p.peak_rate_8h    = rate
+                else:
+                    if rate > p.peak_rate_8h:
+                        p.peak_rate_8h    = rate
                 if period_at is not None:
                     p.last_period_at      = period_at
                 self._total_funding_earned += amount

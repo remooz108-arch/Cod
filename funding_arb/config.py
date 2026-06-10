@@ -15,6 +15,13 @@ GATE_API_KEY       = os.getenv("GATE_API_KEY", "")
 GATE_SECRET        = os.getenv("GATE_SECRET", "")
 HYPERLIQUID_WALLET = os.getenv("HYPERLIQUID_WALLET", "")
 HYPERLIQUID_KEY    = os.getenv("HYPERLIQUID_KEY", "")
+# MEXC — highest altcoin funding rates; often 2-5× Gate.io on same coins
+MEXC_API_KEY       = os.getenv("MEXC_API_KEY", "")
+MEXC_SECRET        = os.getenv("MEXC_SECRET", "")
+# Bitget — strong altcoin selection, competitive rates, copy-trading liquidity
+BITGET_API_KEY     = os.getenv("BITGET_API_KEY", "")
+BITGET_SECRET      = os.getenv("BITGET_SECRET", "")
+BITGET_PASSPHRASE  = os.getenv("BITGET_PASSPHRASE", "")
 
 # ── Capital (the ONE number you need to change) ───────────────────────────────
 # Everything else derives from this automatically — position size, compound
@@ -167,6 +174,30 @@ TIMING_GATE_MINUTES = int(os.getenv("TIMING_GATE_MINUTES", "15"))
 # -0.3 means "skip if rate has fallen more than 30% of its own value."
 MOMENTUM_FILTER_ENABLED = os.getenv("MOMENTUM_FILTER_ENABLED", "true").lower() == "true"
 MIN_RATE_MOMENTUM       = float(os.getenv("MIN_RATE_MOMENTUM", "-0.3"))
+
+# ── Negative funding harvesting ───────────────────────────────────────────────
+# When funding rates go NEGATIVE, shorts pay longs. Flip the hedge:
+# short spot on margin + long perp to collect inverse payments.
+# Requires margin/cross-margin trading to be enabled on the exchange.
+NEGATIVE_FUNDING_ENABLED  = os.getenv("NEGATIVE_FUNDING_ENABLED", "false").lower() == "true"
+MIN_NEGATIVE_FUNDING_RATE = float(os.getenv("MIN_NEGATIVE_FUNDING_RATE", "0.0003"))
+MARGIN_INTEREST_RATE      = float(os.getenv("MARGIN_INTEREST_RATE", "0.0002"))  # 0.02%/day
+
+# ── Rate-proportional position sizing ─────────────────────────────────────────
+# Allocate more capital to higher-quality rates. A rate 3× the minimum threshold
+# gets up to MAX_SIZE_MULTIPLIER × the base position size, capped at MAX_TOTAL/3.
+RATE_PROPORTIONAL_SIZING = os.getenv("RATE_PROPORTIONAL_SIZING", "true").lower() == "true"
+MAX_SIZE_MULTIPLIER      = float(os.getenv("MAX_SIZE_MULTIPLIER", "2.0"))
+
+# ── Cross-exchange arbitrage ──────────────────────────────────────────────────
+# Buy spot on the most liquid exchange, short perp on the highest-rate exchange.
+# Requires capital pre-funded on both exchanges simultaneously.
+CROSS_EXCHANGE_ARB       = os.getenv("CROSS_EXCHANGE_ARB", "true").lower() == "true"
+SPOT_EXCHANGE_PREFERENCE = [
+    s.strip() for s in
+    os.getenv("SPOT_EXCHANGE_PREFERENCE", "binance,bybit,okx,gateio,mexc,bitget").split(",")
+    if s.strip()
+]
 
 # ── Telegram notifications ────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
