@@ -76,6 +76,28 @@ MAX_BREAKEVEN_PERIODS = int(os.getenv("MAX_BREAKEVEN_PERIODS", "12"))
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# ── Per-asset concentration cap ───────────────────────────────────────────────
+# Never deploy more than this fraction of MAX_TOTAL_USDC in a single base asset
+# across ALL exchanges (e.g. BTC on Binance + BTC on Gate counts together).
+MAX_ASSET_FRACTION = float(os.getenv("MAX_ASSET_FRACTION", "0.3"))  # 30% per coin
+
+# ── Trailing rate stop ────────────────────────────────────────────────────────
+# Exit a position when its current rate has dropped this fraction below the
+# highest rate seen since entry. Captures decaying rates before they hit
+# the EXIT_FUNDING_RATE hard floor.
+TRAILING_RATE_STOP = float(os.getenv("TRAILING_RATE_STOP", "0.5"))  # 50% below peak
+
+# ── Perp leverage ─────────────────────────────────────────────────────────────
+# Explicitly set leverage on the perp short leg.  1× = no amplification,
+# maximum distance from liquidation.  Never set above 3× for arb strategies.
+PERP_LEVERAGE = int(os.getenv("PERP_LEVERAGE", "1"))
+
+# ── Margin health guard ───────────────────────────────────────────────────────
+# Monitor the perp margin ratio (maintenanceMargin / collateral).
+# Telegram alert at MARGIN_ALERT_RATIO; auto-exit at MARGIN_EXIT_RATIO.
+MARGIN_ALERT_RATIO = float(os.getenv("MARGIN_ALERT_RATIO", "0.5"))
+MARGIN_EXIT_RATIO  = float(os.getenv("MARGIN_EXIT_RATIO",  "0.8"))
+
 # ── Rate stability filter ─────────────────────────────────────────────────────
 # Only enter a position if the rate has been above MIN_FUNDING_RATE for this
 # many consecutive scans. Prevents entering on 1-scan transient spikes.

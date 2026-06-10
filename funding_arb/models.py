@@ -44,6 +44,7 @@ class Position:
     spot_order_id: Optional[str] = None
     perp_order_id: Optional[str] = None
     last_period_at: Optional[datetime] = None  # tracks 8h funding window
+    peak_rate_8h: float = 0.0                  # highest rate seen since entry
 
     @property
     def apy_realised(self) -> float:

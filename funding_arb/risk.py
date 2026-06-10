@@ -42,6 +42,7 @@ def _pos_to_dict(pos: Position) -> dict:
         "funding_collected": pos.funding_collected,
         "funding_periods":   pos.funding_periods,
         "last_rate_8h":      pos.last_rate_8h,
+        "peak_rate_8h":      pos.peak_rate_8h,
         "spot_order_id":     pos.spot_order_id,
         "perp_order_id":     pos.perp_order_id,
         "last_period_at":    pos.last_period_at.isoformat() if pos.last_period_at else None,
@@ -73,6 +74,7 @@ def _pos_from_dict(d: dict) -> Position:
         funding_collected= float(d.get("funding_collected", 0)),
         funding_periods  = int(d.get("funding_periods", 0)),
         last_rate_8h     = float(d.get("last_rate_8h", 0)),
+        peak_rate_8h     = float(d.get("peak_rate_8h", d.get("last_rate_8h", 0))),
         spot_order_id    = d.get("spot_order_id"),
         perp_order_id    = d.get("perp_order_id"),
         last_period_at   = _parse_dt(d.get("last_period_at")),
@@ -242,6 +244,17 @@ class RiskManager:
                     f"Exchange cap: ${ex_deployed:.0f} on {exchange} "
                     f"+ ${size:.0f} > ${max_per_ex:.0f} (50% limit)"
                 )
+            # Per-asset cap: diversify across coins, not just exchanges.
+            max_per_asset  = config.MAX_TOTAL_USDC * config.MAX_ASSET_FRACTION
+            asset_deployed = sum(
+                p.size_usdc for p in self._positions.values() if p.base == base
+            )
+            if asset_deployed + size > max_per_asset:
+                return False, (
+                    f"Asset cap: ${asset_deployed:.0f} in {base} "
+                    f"+ ${size:.0f} > ${max_per_asset:.0f} "
+                    f"({config.MAX_ASSET_FRACTION:.0%} limit)"
+                )
             return True, "OK"
 
     def should_exit(
@@ -254,6 +267,18 @@ class RiskManager:
                 f"Rate {current_rate:.4%} below exit "
                 f"threshold {config.EXIT_FUNDING_RATE:.4%}"
             )
+        # Trailing rate stop: exit when rate has fallen too far from its peak.
+        if (
+            config.TRAILING_RATE_STOP > 0
+            and pos.peak_rate_8h > 0
+            and current_rate is not None
+        ):
+            drop = (pos.peak_rate_8h - current_rate) / pos.peak_rate_8h
+            if drop >= config.TRAILING_RATE_STOP:
+                return True, (
+                    f"Trailing stop: rate dropped {drop:.0%} from peak "
+                    f"({pos.peak_rate_8h:.4%} → {current_rate:.4%}/8h)"
+                )
         return False, ""
 
     # ── Position lifecycle ────────────────────────────────────────────────────
@@ -268,7 +293,10 @@ class RiskManager:
         """Update last_rate_8h for display; does NOT count a funding period."""
         with self._lock:
             if pos_id in self._positions:
-                self._positions[pos_id].last_rate_8h = rate
+                p = self._positions[pos_id]
+                p.last_rate_8h = rate
+                if rate > p.peak_rate_8h:
+                    p.peak_rate_8h = rate
 
     def record_funding(
         self, pos_id: str, amount: float, rate: float, period_at: Optional[datetime] = None
@@ -281,6 +309,8 @@ class RiskManager:
                 p.funding_collected      += amount
                 p.funding_periods        += 1
                 p.last_rate_8h            = rate
+                if rate > p.peak_rate_8h:
+                    p.peak_rate_8h        = rate
                 if period_at is not None:
                     p.last_period_at      = period_at
                 self._total_funding_earned += amount

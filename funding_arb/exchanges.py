@@ -243,3 +243,37 @@ def fetch_current_funding_rate(ex: Any, perp_symbol: str) -> Optional[float]:
         return float(info.get("fundingRate") or 0)
     except Exception:
         return None
+
+
+def set_leverage(ex: Any, symbol: str, leverage: int) -> None:
+    """Set leverage for a perp symbol before opening a short. Silent if unsupported."""
+    try:
+        ex.set_leverage(leverage, symbol)
+    except Exception:
+        pass  # Not all exchanges require or support explicit leverage setting
+
+
+def fetch_margin_ratio(ex: Any, symbol: str) -> Optional[float]:
+    """
+    Return the margin health ratio for a short position on `symbol`.
+
+    Uses CCXT-normalised `marginRatio` (maintenanceMargin / collateral).
+    Higher values mean closer to liquidation; 1.0 = liquidation threshold.
+    Returns None if the exchange doesn't expose this data.
+    """
+    try:
+        positions = ex.fetch_positions([symbol])
+        for p in positions:
+            if p.get("symbol") != symbol:
+                continue
+            mr = p.get("marginRatio")
+            if mr is not None:
+                return float(mr)
+            # Fallback: compute from components if raw fields are available.
+            maint  = float(p.get("maintenanceMargin") or 0)
+            margin = float(p.get("initialMargin") or p.get("collateral") or 0)
+            if margin > 0:
+                return maint / margin
+    except Exception:
+        pass
+    return None

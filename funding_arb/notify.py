@@ -68,6 +68,15 @@ def spike_alert(exchange: str, base: str, rate_8h: float, apy: float) -> None:
     )
 
 
+def margin_alert(exchange: str, base: str, ratio: float, action: str) -> None:
+    exited = action.upper() == "EXITED"
+    _send(
+        f"{'🔴' if exited else '🟡'} <b>MARGIN {action.upper()}</b>  {exchange.upper()} {base}\n"
+        f"Margin ratio: {ratio:.2f}  "
+        f"{'— Position closed to prevent liquidation!' if exited else '— Monitor closely, approaching danger zone.'}"
+    )
+
+
 def hedge_drift_alert(exchange: str, base: str, drift_pct: float) -> None:
     _send(
         f"⚠️ <b>HEDGE DRIFT</b>  {exchange.upper()} {base}\n"

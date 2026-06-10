@@ -36,15 +36,18 @@ import csv
 import os
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 import config
 from exchanges import (
     build_exchanges,
     fetch_all_funding_rates,
     fetch_current_funding_rate,
+    fetch_margin_ratio,
     has_spot_market,
     place_spot_buy,
     place_perp_short,
+    set_leverage,
     close_spot_position,
     close_perp_position,
     get_spot_symbol,
@@ -129,6 +132,119 @@ def check_hedge_drift(
             pass
 
 
+# ── Margin health guard ───────────────────────────────────────────────────────
+
+def check_margin_health(
+    positions: list, exchanges: dict, risk: "RiskManager", live: bool
+) -> None:
+    """Alert or exit positions whose perp short margin is approaching liquidation."""
+    for pos in positions:
+        ex = exchanges.get(pos.exchange)
+        if not ex:
+            continue
+        ratio = fetch_margin_ratio(ex, pos.perp_symbol)
+        if ratio is None:
+            continue
+        if ratio >= config.MARGIN_EXIT_RATIO:
+            reason = f"Margin critical: ratio {ratio:.2f} >= exit threshold {config.MARGIN_EXIT_RATIO}"
+            log(f"  EXIT {pos.id} — {reason}")
+            close_position(pos, exchanges, risk, live=live, reason=reason)
+            risk.save_state()
+            notify.margin_alert(pos.exchange, pos.base, ratio, "exited")
+        elif ratio >= config.MARGIN_ALERT_RATIO:
+            log(f"  ⚠️  MARGIN WARNING {pos.id}: ratio={ratio:.2f}")
+            notify.margin_alert(pos.exchange, pos.base, ratio, "warning")
+
+
+# ── Performance report ────────────────────────────────────────────────────────
+
+def print_performance_report() -> None:
+    """Print a full P&L breakdown from the trade journal CSV and exit."""
+    from collections import defaultdict
+    from datetime import timedelta
+
+    path = config.TRADE_JOURNAL_FILE
+    if not os.path.exists(path):
+        print(f"No trade journal at {path}. Run the bot first.")
+        return
+
+    rows = []
+    with open(path, newline="") as fh:
+        rows = list(csv.DictReader(fh))
+
+    if not rows:
+        print("Trade journal is empty.")
+        return
+
+    def _dt(s: str) -> Optional[datetime]:
+        if not s:
+            return None
+        try:
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    def _earned(r: dict) -> float:
+        try:
+            return float(r.get("funding_collected") or 0)
+        except ValueError:
+            return 0.0
+
+    now    = datetime.now(timezone.utc)
+    week   = now - timedelta(days=7)
+    month  = now - timedelta(days=30)
+
+    total   = sum(_earned(r) for r in rows)
+    last_7d = sum(_earned(r) for r in rows if (_dt(r.get("closed_at", "")) or now) >= week)
+    last_30 = sum(_earned(r) for r in rows if (_dt(r.get("closed_at", "")) or now) >= month)
+
+    by_exchange: dict[str, float] = defaultdict(float)
+    by_asset:    dict[str, float] = defaultdict(float)
+    apys: list[float] = []
+
+    for r in rows:
+        by_exchange[r.get("exchange", "?")] += _earned(r)
+        by_asset[r.get("base", "?")]        += _earned(r)
+        a = r.get("apy_realised_pct", "n/a")
+        if a != "n/a":
+            try:
+                apys.append(float(a))
+            except ValueError:
+                pass
+
+    avg_apy = sum(apys) / len(apys) if apys else 0.0
+    n       = len(rows)
+
+    print(f"\n{'='*70}")
+    print(f"  FUNDING ARB PERFORMANCE REPORT")
+    print(f"  Generated {now.strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"{'='*70}")
+    print(f"  Completed trades   : {n}")
+    print(f"  All-time earned    : ${total:+.4f}")
+    print(f"  Last 7 days        : ${last_7d:+.4f}")
+    print(f"  Last 30 days       : ${last_30:+.4f}")
+    print(f"  Avg realised APY   : {avg_apy:.1f}%")
+
+    print(f"\n  ── By Exchange {'─'*40}")
+    for ex, amt in sorted(by_exchange.items(), key=lambda x: -x[1]):
+        bar = "█" * int(amt / max(total, 0.01) * 20) if total > 0 else ""
+        print(f"  {ex:14s}  ${amt:+8.4f}  {bar}")
+
+    print(f"\n  ── Top Assets {'─'*42}")
+    for base, amt in sorted(by_asset.items(), key=lambda x: -x[1])[:12]:
+        bar = "█" * int(amt / max(total, 0.01) * 20) if total > 0 else ""
+        print(f"  {base:10s}  ${amt:+8.4f}  {bar}")
+
+    print(f"\n  ── Exit Reasons {'─'*40}")
+    reasons: dict[str, int] = defaultdict(int)
+    for r in rows:
+        reasons[r.get("reason", "unknown")] += 1
+    for reason, count in sorted(reasons.items(), key=lambda x: -x[1]):
+        print(f"  {reason:30s}  {count}×")
+
+    print(f"{'='*70}\n")
+
+
 # ── Entry ─────────────────────────────────────────────────────────────────────
 
 def open_position(
@@ -183,6 +299,10 @@ def open_position(
     spot_order_id = perp_order_id = None
 
     if live:
+        # Enforce low leverage before opening the short to maximise distance
+        # from liquidation.  Silent no-op if the exchange doesn't support it.
+        set_leverage(ex, rate.symbol, config.PERP_LEVERAGE)
+
         try:
             sr          = place_spot_buy(ex, rate.base, half)
             spot_order_id = sr.get("id")
@@ -220,6 +340,7 @@ def open_position(
         size_usdc=pos_size,
         opened_at=datetime.now(timezone.utc),
         last_rate_8h=rate.rate_8h,
+        peak_rate_8h=rate.rate_8h,
         spot_order_id=spot_order_id,
         perp_order_id=perp_order_id,
     )
@@ -431,7 +552,11 @@ def run(live: bool = False, no_ui: bool = False) -> None:
 
             # ── Hedge drift check ─────────────────────────────────────────────
             check_hedge_drift(positions, exchanges, risk, live=config.LIVE_TRADING)
-            # Refresh after potential drift-triggered closes.
+
+            # ── Margin health guard ───────────────────────────────────────────
+            check_margin_health(positions, exchanges, risk, live=config.LIVE_TRADING)
+
+            # Refresh snapshot after potential drift/margin-triggered closes.
             positions = risk.open_positions()
             open_ids  = {p.id for p in positions}
 
@@ -505,8 +630,13 @@ def run(live: bool = False, no_ui: bool = False) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Funding rate arbitrage bot v2")
-    parser.add_argument("--live",  action="store_true", help="Place real orders")
-    parser.add_argument("--no-ui", action="store_true", dest="no_ui",
+    parser.add_argument("--live",   action="store_true", help="Place real orders")
+    parser.add_argument("--no-ui",  action="store_true", dest="no_ui",
                         help="Log mode, no dashboard")
+    parser.add_argument("--report", action="store_true",
+                        help="Print P&L report from trade journal and exit")
     args = parser.parse_args()
-    run(live=args.live, no_ui=args.no_ui)
+    if args.report:
+        print_performance_report()
+    else:
+        run(live=args.live, no_ui=args.no_ui)
