@@ -163,8 +163,12 @@ def fetch_all_funding_rates(exchanges: dict[str, Any]) -> list[FundingRate]:
     seen: dict[str, FundingRate] = {}
     for r in all_rates:
         key = f"{r.exchange}:{r.symbol}"
-        if key not in seen or r.rate_8h > seen[key].rate_8h:
+        if key not in seen:
             seen[key] = r
+        elif r.rate_8h > 0 and r.rate_8h > seen[key].rate_8h:
+            seen[key] = r  # positive: keep highest
+        elif r.rate_8h < 0 and r.rate_8h < seen[key].rate_8h:
+            seen[key] = r  # negative: keep most-negative (most income for inverse arb)
     return sorted(seen.values(), key=lambda r: r.rate_8h, reverse=True)
 
 
@@ -289,6 +293,8 @@ def set_leverage(ex: Any, symbol: str, leverage: int) -> None:
 
 def _await_fill(ex: Any, order_id: str, symbol: str, fill_timeout: int) -> Optional[dict]:
     """Poll until an order is filled or the timeout expires. Returns filled order or None."""
+    if not order_id:
+        return None  # can't track — caller falls back to market
     deadline = time.time() + fill_timeout
     while time.time() < deadline:
         time.sleep(2)
@@ -320,7 +326,10 @@ def place_spot_buy_maker(ex: Any, base: str, usdc_amount: float, fill_timeout: i
             order = ex.create_limit_buy_order(
                 symbol, qty, price, params={"postOnly": True}
             )
-            result = _await_fill(ex, order["id"], symbol, fill_timeout)
+            result = _await_fill(
+                ex, order.get("id") or order.get("orderId"),
+                symbol, fill_timeout,
+            )
             if result:
                 return result
     except Exception:
@@ -340,7 +349,10 @@ def place_perp_short_maker(ex: Any, perp_symbol: str, usdc_amount: float, fill_t
                 perp_symbol, qty, price,
                 params={"postOnly": True, "reduceOnly": False},
             )
-            result = _await_fill(ex, order["id"], perp_symbol, fill_timeout)
+            result = _await_fill(
+                ex, order.get("id") or order.get("orderId"),
+                perp_symbol, fill_timeout,
+            )
             if result:
                 return result
     except Exception:
@@ -360,7 +372,10 @@ def close_spot_position_maker(ex: Any, base: str, qty: float, fill_timeout: int 
             order   = ex.create_limit_sell_order(
                 symbol, qty_str, price, params={"postOnly": True}
             )
-            result = _await_fill(ex, order["id"], symbol, fill_timeout)
+            result = _await_fill(
+                ex, order.get("id") or order.get("orderId"),
+                symbol, fill_timeout,
+            )
             if result:
                 return result
     except Exception:
@@ -380,7 +395,10 @@ def close_perp_position_maker(ex: Any, perp_symbol: str, qty: float, fill_timeou
                 perp_symbol, qty_str, price,
                 params={"postOnly": True, "reduceOnly": True},
             )
-            result = _await_fill(ex, order["id"], perp_symbol, fill_timeout)
+            result = _await_fill(
+                ex, order.get("id") or order.get("orderId"),
+                perp_symbol, fill_timeout,
+            )
             if result:
                 return result
     except Exception:
@@ -402,12 +420,18 @@ def place_spot_short(ex: Any, base: str, usdc_amount: float) -> dict:
 
 
 def close_spot_short(ex: Any, base: str, qty: float) -> dict:
-    """Buy back to close a margin short position."""
+    """Buy back to close a margin short position. Uses exchange-aware params."""
     symbol  = get_spot_symbol(ex.id, base)
     qty_str = ex.amount_to_precision(symbol, qty)
-    return ex.create_market_buy_order(
-        symbol, float(qty_str), params={"marginMode": "cross", "type": "margin"}
-    )
+    eid = getattr(ex, "id", "").lower()
+    if eid == "bybit":
+        # Bybit Unified: plain spot buy auto-repays the borrow
+        params: dict = {}
+    elif eid == "binance":
+        params = {"marginMode": "cross", "type": "margin"}
+    else:
+        params = {"marginMode": "cross"}
+    return ex.create_market_buy_order(symbol, float(qty_str), params=params)
 
 
 def place_perp_long(ex: Any, perp_symbol: str, usdc_amount: float) -> dict:

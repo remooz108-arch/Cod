@@ -315,14 +315,18 @@ def open_position(
 
     ok, reason = risk.can_open(ex_name, rate.base, size_override=pos_size)
     if not ok:
-        log(f"  Skip {ex_name}:{rate.base} — {reason}")
-        return
+        # If proportional sizing inflated pos_size beyond available capital,
+        # retry with the un-inflated base size so the slot is not permanently wasted.
+        base_size = risk.effective_position_size()
+        if config.RATE_PROPORTIONAL_SIZING and pos_size > base_size:
+            ok, reason = risk.can_open(ex_name, rate.base, size_override=base_size)
+            if ok:
+                pos_size = base_size
+        if not ok:
+            log(f"  Skip {ex_name}:{rate.base} — {reason}")
+            return
 
-    # Verify spot market exists before committing
     ex = exchanges[ex_name]
-    if not has_spot_market(ex, rate.base):
-        log(f"  Skip {ex_name}:{rate.base} — no spot market")
-        return
 
     # Entry quality gate: skip if round-trip fees can't be recovered in time.
     round_trip_cost = config.TAKER_FEE_PCT * 4
@@ -374,6 +378,11 @@ def open_position(
                 if has_spot_market(exchanges[preferred], rate.base):
                     spot_ex_name = preferred
                     break
+
+    # Validate the actual spot exchange (not the perp exchange).
+    if not has_spot_market(exchanges[spot_ex_name], rate.base):
+        log(f"  Skip {ex_name}:{rate.base} — no spot market on {spot_ex_name}")
+        return
 
     half         = pos_size / 2
     spot_symbol  = get_spot_symbol(spot_ex_name, rate.base)
@@ -635,8 +644,9 @@ def close_position(
     # Block re-entry on the same side for a cooldown window to prevent whipsawing.
     risk.start_cooldown(pos.exchange, pos.base, pos.direction)
 
-    # Circuit breaker: count rate-flip exits (not rotations or drift exits).
-    if any(w in reason.lower() for w in ("rate", "negative", "below", "positive")):
+    # Circuit breaker: only count genuine rate flips — rate going negative for longs,
+    # or going positive for inverse shorts. Normal threshold exits are not flip events.
+    if any(w in reason.lower() for w in ("went negative", "went positive")):
         risk.record_flip_exit()
 
 
@@ -664,7 +674,11 @@ def accrue_funding(
         # Exchange credits the payment to the margin balance automatically.
         baseline = pos.last_period_at if pos.last_period_at is not None else pos.opened_at
         if (now - baseline).total_seconds() >= _EIGHT_HOURS_S:
-            risk.record_funding(pos.id, 0.0, rate, period_at=now)
+            # Estimate income: abs(rate) × perp notional (half of position size).
+            # Actual exchange credit may differ slightly by mark price; this is
+            # the best estimate without an extra balance API call.
+            amount = abs(rate) * (pos.size_usdc / 2)
+            risk.record_funding(pos.id, amount, rate, period_at=now)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -809,13 +823,19 @@ def run(live: bool = False, no_ui: bool = False) -> None:
                 should, reason = risk.should_exit(pos, current_rate)
                 if should:
                     # Soft exits (rate decay) can use maker; hard exits (negative) market.
-                    soft = "below exit" in reason or "Trailing" in reason
+                    # Hard exits: rate went negative (long) or positive (inverse) — use market.
+                    # Soft exits: rate decayed to threshold or trailing stop — can use maker.
+                    hard_keywords = ("went negative", "went positive")
+                    soft = not any(w in reason.lower() for w in hard_keywords)
                     close_position(
                         pos, exchanges, risk,
                         live=config.LIVE_TRADING, reason=reason,
                         use_maker=soft,
                     )
                     risk.save_state()
+
+            # Refresh snapshot so accrue/drift/margin don't run on already-closed positions.
+            positions = risk.open_positions()
 
             # ── Accrue funding ────────────────────────────────────────────────
             accrue_funding(positions, exchanges, risk)

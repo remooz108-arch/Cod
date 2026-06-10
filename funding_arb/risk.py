@@ -520,11 +520,15 @@ class RiskManager:
             }
 
     def worst_position(self) -> Optional[Position]:
-        """Return the open position with the lowest current funding rate."""
+        """Return the weakest long position by current rate (for rotation candidates).
+        Inverse (short) positions are excluded — their negative rate_8h would
+        always make them appear worst and cause spurious rotation.
+        """
         with self._lock:
-            if not self._positions:
+            longs = [p for p in self._positions.values() if p.direction == "long"]
+            if not longs:
                 return None
-            return min(self._positions.values(), key=lambda p: p.last_rate_8h)
+            return min(longs, key=lambda p: p.last_rate_8h)
 
     def exchange_deployed(self, exchange: str) -> float:
         """Total USDC deployed on a specific exchange."""
@@ -545,6 +549,9 @@ class RiskManager:
                 "positions": [_pos_to_dict(p) for p in self._positions.values()],
                 "cooldowns": {
                     k: v.isoformat() for k, v in self._cooldowns.items()
+                },
+                "rate_history": {
+                    k: list(v) for k, v in self._rate_history.items()
                 },
             }
         tmp = path + ".tmp"
@@ -568,6 +575,11 @@ class RiskManager:
                 for d in state.get("positions", []):
                     pos = _pos_from_dict(d)
                     self._positions[pos.id] = pos
+                window = max(config.RATE_HISTORY_SAMPLES, config.RATE_STABILITY_SCANS + 1, 2)
+                for k, vals in state.get("rate_history", {}).items():
+                    dq = deque(maxlen=window)
+                    dq.extend(vals[-window:])
+                    self._rate_history[k] = dq
                 now = _utcnow()
                 for k, iso in state.get("cooldowns", {}).items():
                     try:
