@@ -428,21 +428,28 @@ def run(live: bool = False, no_ui: bool = False) -> None:
     print(f"\n{'='*70}")
     print(f"  FUNDING RATE ARBITRAGE BOT  v2  [{mode}]")
     print(f"{'='*70}")
+    print(f"  Capital    : ${config.MAX_TOTAL_USDC:,.2f} USDC")
     print(f"  Strategy   : Long spot + Short perp → collect funding every 8h")
     print(f"  Entry      : rate > {config.MIN_FUNDING_RATE:.4%}/8h  "
           f"({config.rate_to_apy(config.MIN_FUNDING_RATE):.1f}% APY)")
     print(f"  Exit       : rate < {config.EXIT_FUNDING_RATE:.4%}/8h or negative")
-    print(f"  Position   : ${config.POSITION_SIZE_USDC:.0f} USDC base size")
-    print(f"  Max pos    : {config.MAX_POSITIONS}  |  Cap: ${config.MAX_TOTAL_USDC:,.0f} USDC")
+    print(f"  Position   : ${config.POSITION_SIZE_USDC:.2f} USDC  "
+          f"({config.MAX_POSITIONS} slots × ${config.POSITION_SIZE_USDC:.2f})")
     print(f"  Exchanges  : Binance · Bybit · OKX · Gate.io · Hyperliquid")
     print(f"  Compound   : {'ON' if config.COMPOUND_ENABLED else 'OFF'}  "
-          f"(+10 % per ${config.COMPOUND_THRESHOLD:.0f} earned)")
+          f"(+10% per ${config.COMPOUND_THRESHOLD:.2f} earned)")
     print(f"  Spike alert: rate > {config.SPIKE_ALERT_RATE:.4%}/8h  "
           f"({config.rate_to_apy(config.SPIKE_ALERT_RATE):.0f}% APY)")
-    print(f"  Daily goal : ${config.TARGET_DAILY_USDC:.0f}")
+    print(f"  Daily goal : ${config.TARGET_DAILY_USDC:.2f}")
     est_daily = config.daily_income_est(config.MIN_FUNDING_RATE, config.MAX_TOTAL_USDC)
-    print(f"  Est. daily : ${est_daily:.2f} (full cap at entry threshold)")
-    print(f"{'='*70}\n")
+    print(f"  Est. daily : ${est_daily:.2f}  "
+          f"(full cap at entry-threshold rate, ~{est_daily/config.MAX_TOTAL_USDC*100:.2f}%/day)")
+    print(f"{'='*70}")
+
+    # Print any configuration warnings before starting.
+    for w in config.validate():
+        print(f"  ⚠️  WARNING: {w}")
+    print()
 
     log("Building exchange connections…")
     exchanges = build_exchanges()

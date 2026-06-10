@@ -13,120 +13,105 @@ OKX_SECRET         = os.getenv("OKX_SECRET", "")
 OKX_PASSPHRASE     = os.getenv("OKX_PASSPHRASE", "")
 GATE_API_KEY       = os.getenv("GATE_API_KEY", "")
 GATE_SECRET        = os.getenv("GATE_SECRET", "")
-HYPERLIQUID_WALLET = os.getenv("HYPERLIQUID_WALLET", "")  # 0x… EVM address
-HYPERLIQUID_KEY    = os.getenv("HYPERLIQUID_KEY", "")     # private key hex (no 0x prefix)
+HYPERLIQUID_WALLET = os.getenv("HYPERLIQUID_WALLET", "")
+HYPERLIQUID_KEY    = os.getenv("HYPERLIQUID_KEY", "")
+
+# ── Capital (the ONE number you need to change) ───────────────────────────────
+# Everything else derives from this automatically — position size, compound
+# threshold, daily target, circuit breaker.  Just set this and go.
+MAX_TOTAL_USDC = float(os.getenv("MAX_TOTAL_USDC", "5000"))
+MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS",  "10"))
+
+# ── Auto-derived scaling ──────────────────────────────────────────────────────
+# These set sensible proportional defaults for any capital level.
+# Override any of them in .env if you want specific values.
+
+# Position size = equal share of capital across all slots.
+_pos_default = MAX_TOTAL_USDC / MAX_POSITIONS
+POSITION_SIZE_USDC = float(os.getenv("POSITION_SIZE_USDC", str(_pos_default)))
+
+# Compound trigger = 2% of capital earned (min $2 to avoid never triggering).
+_compound_default = max(2.0, round(MAX_TOTAL_USDC * 0.02, 2))
+COMPOUND_THRESHOLD = float(os.getenv("COMPOUND_THRESHOLD", str(_compound_default)))
+
+# Daily income target for the progress bar = 0.3%/day at entry-rate floor.
+# At MIN_FUNDING_RATE (0.03%/8h × 3/day × capital) this is modest but achievable.
+_daily_default = max(0.10, round(MAX_TOTAL_USDC * 0.003, 2))
+TARGET_DAILY_USDC = float(os.getenv("TARGET_DAILY_USDC", str(_daily_default)))
+
+# Circuit breaker = trip after losing 1/3 of positions to rate flips (min 2).
+_cb_default = max(2, MAX_POSITIONS // 3)
+CIRCUIT_BREAKER_EXITS = int(os.getenv("CIRCUIT_BREAKER_EXITS", str(_cb_default)))
 
 # ── Strategy ────────────────────────────────────────────────────────────────
 # 0.03 %/8h ≈ 32 % APY  — conservative entry; altcoins regularly hit 0.1–1 %
-MIN_FUNDING_RATE   = float(os.getenv("MIN_FUNDING_RATE",  "0.0003"))
-EXIT_FUNDING_RATE  = float(os.getenv("EXIT_FUNDING_RATE", "0.0001"))
-POSITION_SIZE_USDC = float(os.getenv("POSITION_SIZE_USDC", "500"))
-MAX_POSITIONS      = int(os.getenv("MAX_POSITIONS", "10"))   # 10 altcoin slots
-MAX_TOTAL_USDC     = float(os.getenv("MAX_TOTAL_USDC", "5000"))
-SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL", "60"))
-LIVE_TRADING       = os.getenv("LIVE_TRADING", "false").lower() == "true"
+MIN_FUNDING_RATE  = float(os.getenv("MIN_FUNDING_RATE",  "0.0003"))
+EXIT_FUNDING_RATE = float(os.getenv("EXIT_FUNDING_RATE", "0.0001"))
+SCAN_INTERVAL     = int(os.getenv("SCAN_INTERVAL", "60"))
+LIVE_TRADING      = os.getenv("LIVE_TRADING", "false").lower() == "true"
 
 # ── State persistence ─────────────────────────────────────────────────────────
-# Written on every position open/close so the bot can resume after a restart
-# without losing track of what is open on the exchanges.
-STATE_FILE         = os.getenv("STATE_FILE", "./funding_arb_state.json")
+STATE_FILE = os.getenv("STATE_FILE", "./funding_arb_state.json")
 
 # ── Altcoin filters ─────────────────────────────────────────────────────────
-# Comma-separated list of base assets to never trade (rug-prone, zero-liquidity)
 _USER_BLACKLIST = set(b.upper() for b in os.getenv("BLACKLIST_BASES", "").split(",") if b)
 BLACKLIST_BASES  = _USER_BLACKLIST | {"LUNA", "LUNC", "UST", "USTC", "FTT", "BUSD"}
-
-# Minimum USDC mark price — filters out ultra-micro-cap coins with wide spreads
-MIN_MARK_PRICE = float(os.getenv("MIN_MARK_PRICE", "0"))
+MIN_MARK_PRICE   = float(os.getenv("MIN_MARK_PRICE", "0"))
 
 # ── Spike alerts ────────────────────────────────────────────────────────────
-# Rate above this triggers a SPIKE alert in the dashboard and logs
-# 0.002 = 0.2 %/8h ≈ 220 % APY — well above normal, worth noting
 SPIKE_ALERT_RATE = float(os.getenv("SPIKE_ALERT_RATE", "0.002"))
 
 # ── Auto-compounding ─────────────────────────────────────────────────────────
-# Each time total_funding_earned crosses a multiple of COMPOUND_THRESHOLD,
-# effective position size increases by 10 %.
-COMPOUND_ENABLED   = os.getenv("COMPOUND_ENABLED", "true").lower() == "true"
-COMPOUND_THRESHOLD = float(os.getenv("COMPOUND_THRESHOLD", "100"))  # reinvest per $100 earned
-
-# ── Income target (display only) ─────────────────────────────────────────────
-TARGET_DAILY_USDC  = float(os.getenv("TARGET_DAILY_USDC", "50"))
+COMPOUND_ENABLED = os.getenv("COMPOUND_ENABLED", "true").lower() == "true"
+# COMPOUND_THRESHOLD derived above from capital size.
 
 # ── Position rotation ─────────────────────────────────────────────────────────
-# When at MAX_POSITIONS, close the weakest if a new rate is ROTATION_THRESHOLD× better.
-# MIN_HOLD_PERIODS prevents churning out a position before it has covered entry costs.
-ROTATION_ENABLED    = os.getenv("ROTATION_ENABLED", "true").lower() == "true"
-ROTATION_THRESHOLD  = float(os.getenv("ROTATION_THRESHOLD", "1.5"))  # 50% better rate required
-MIN_HOLD_PERIODS    = int(os.getenv("MIN_HOLD_PERIODS", "2"))         # hold ≥2 periods (16h) before rotation
+ROTATION_ENABLED   = os.getenv("ROTATION_ENABLED",  "true").lower() == "true"
+ROTATION_THRESHOLD = float(os.getenv("ROTATION_THRESHOLD", "1.5"))
+MIN_HOLD_PERIODS   = int(os.getenv("MIN_HOLD_PERIODS", "2"))
 
-# ── Per-exchange concentration cap ───────────────────────────────────────────
-# Limits how much capital can sit on a single exchange.
-# 0.5 = never more than 50% of MAX_TOTAL_USDC on one exchange.
-MAX_EXCHANGE_FRACTION = float(os.getenv("MAX_EXCHANGE_FRACTION", "0.5"))
+# ── Concentration caps ────────────────────────────────────────────────────────
+MAX_EXCHANGE_FRACTION = float(os.getenv("MAX_EXCHANGE_FRACTION", "0.5"))  # 50% per exchange
+MAX_ASSET_FRACTION    = float(os.getenv("MAX_ASSET_FRACTION",    "0.3"))  # 30% per coin
 
 # ── Entry quality gate ────────────────────────────────────────────────────────
-# Skip entries whose rate cannot cover round-trip fees within MAX_BREAKEVEN_PERIODS.
-# Round-trip cost ≈ TAKER_FEE_PCT × 4 (entry + exit, both legs).
-# Default: must break even within 12 periods (4 days).
-TAKER_FEE_PCT         = float(os.getenv("TAKER_FEE_PCT", "0.0005"))  # 0.05% per leg
-MAX_BREAKEVEN_PERIODS = int(os.getenv("MAX_BREAKEVEN_PERIODS", "12"))
-
-# ── Telegram notifications ────────────────────────────────────────────────────
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# ── Per-asset concentration cap ───────────────────────────────────────────────
-# Never deploy more than this fraction of MAX_TOTAL_USDC in a single base asset
-# across ALL exchanges (e.g. BTC on Binance + BTC on Gate counts together).
-MAX_ASSET_FRACTION = float(os.getenv("MAX_ASSET_FRACTION", "0.3"))  # 30% per coin
-
-# ── Trailing rate stop ────────────────────────────────────────────────────────
-# Exit a position when its current rate has dropped this fraction below the
-# highest rate seen since entry. Captures decaying rates before they hit
-# the EXIT_FUNDING_RATE hard floor.
-TRAILING_RATE_STOP = float(os.getenv("TRAILING_RATE_STOP", "0.5"))  # 50% below peak
-
-# ── Perp leverage ─────────────────────────────────────────────────────────────
-# Explicitly set leverage on the perp short leg.  1× = no amplification,
-# maximum distance from liquidation.  Never set above 3× for arb strategies.
-PERP_LEVERAGE = int(os.getenv("PERP_LEVERAGE", "1"))
-
-# ── Margin health guard ───────────────────────────────────────────────────────
-# Monitor the perp margin ratio (maintenanceMargin / collateral).
-# Telegram alert at MARGIN_ALERT_RATIO; auto-exit at MARGIN_EXIT_RATIO.
-MARGIN_ALERT_RATIO = float(os.getenv("MARGIN_ALERT_RATIO", "0.5"))
-MARGIN_EXIT_RATIO  = float(os.getenv("MARGIN_EXIT_RATIO",  "0.8"))
+TAKER_FEE_PCT         = float(os.getenv("TAKER_FEE_PCT",         "0.0005"))
+MAX_BREAKEVEN_PERIODS = int(os.getenv("MAX_BREAKEVEN_PERIODS",    "12"))
 
 # ── Rate stability filter ─────────────────────────────────────────────────────
-# Only enter a position if the rate has been above MIN_FUNDING_RATE for this
-# many consecutive scans. Prevents entering on 1-scan transient spikes.
 RATE_STABILITY_ENABLED = os.getenv("RATE_STABILITY_ENABLED", "true").lower() == "true"
 RATE_STABILITY_SCANS   = int(os.getenv("RATE_STABILITY_SCANS", "3"))
 
+# ── Trailing rate stop ────────────────────────────────────────────────────────
+TRAILING_RATE_STOP = float(os.getenv("TRAILING_RATE_STOP", "0.5"))
+
 # ── Hedge drift monitor ───────────────────────────────────────────────────────
-# The spot-perp hedge becomes imperfect as price moves from entry.
-# Alert at HEDGE_DRIFT_ALERT_PCT; auto-exit at HEDGE_DRIFT_EXIT_PCT.
-HEDGE_DRIFT_ALERT_PCT = float(os.getenv("HEDGE_DRIFT_ALERT_PCT", "0.05"))   # 5%
-HEDGE_DRIFT_EXIT_PCT  = float(os.getenv("HEDGE_DRIFT_EXIT_PCT",  "0.15"))   # 15%
+HEDGE_DRIFT_ALERT_PCT = float(os.getenv("HEDGE_DRIFT_ALERT_PCT", "0.05"))
+HEDGE_DRIFT_EXIT_PCT  = float(os.getenv("HEDGE_DRIFT_EXIT_PCT",  "0.15"))
+
+# ── Perp leverage ─────────────────────────────────────────────────────────────
+PERP_LEVERAGE = int(os.getenv("PERP_LEVERAGE", "1"))
+
+# ── Margin health guard ───────────────────────────────────────────────────────
+MARGIN_ALERT_RATIO = float(os.getenv("MARGIN_ALERT_RATIO", "0.5"))
+MARGIN_EXIT_RATIO  = float(os.getenv("MARGIN_EXIT_RATIO",  "0.8"))
 
 # ── Circuit breaker ───────────────────────────────────────────────────────────
-# If CIRCUIT_BREAKER_EXITS or more positions exit due to rate flips within
-# 1 hour, pause new entries until the regime stabilises.
 CIRCUIT_BREAKER_ENABLED = os.getenv("CIRCUIT_BREAKER_ENABLED", "true").lower() == "true"
-CIRCUIT_BREAKER_EXITS   = int(os.getenv("CIRCUIT_BREAKER_EXITS", "3"))
+# CIRCUIT_BREAKER_EXITS derived above from MAX_POSITIONS.
 
 # ── Trade journal ─────────────────────────────────────────────────────────────
-# CSV file where every closed position is logged for performance tracking.
 TRADE_JOURNAL_FILE = os.getenv("TRADE_JOURNAL_FILE", "./funding_arb_trades.csv")
 
 # ── Adaptive scan speed ───────────────────────────────────────────────────────
-# Scan faster when below FAST_SCAN_THRESHOLD utilisation to capture
-# opportunities sooner.
 SCAN_INTERVAL_FAST  = int(os.getenv("SCAN_INTERVAL_FAST",  "30"))
 FAST_SCAN_THRESHOLD = float(os.getenv("FAST_SCAN_THRESHOLD", "0.5"))
 
-# ── Annualised equivalents (3 × 365 = 1095 periods per year) ─────────────────
+# ── Telegram notifications ────────────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ── Annualised equivalents ────────────────────────────────────────────────────
 PERIODS_PER_YEAR = 3 * 365
 
 
@@ -137,3 +122,28 @@ def rate_to_apy(rate_per_8h: float) -> float:
 def daily_income_est(rate_per_8h: float, deployed_usdc: float) -> float:
     """Rough daily income estimate: 3 funding periods × rate × capital."""
     return deployed_usdc * rate_per_8h * 3
+
+
+def validate() -> list[str]:
+    """
+    Return a list of human-readable warnings about the current configuration.
+    The bot still runs — these are advisory, not fatal.
+    """
+    warnings: list[str] = []
+    min_viable = 15.0  # most exchanges reject orders below ~$10-15
+    if POSITION_SIZE_USDC < min_viable:
+        warnings.append(
+            f"Position size ${POSITION_SIZE_USDC:.2f} may be below exchange minimums "
+            f"(~${min_viable:.0f}). Consider reducing MAX_POSITIONS or increasing MAX_TOTAL_USDC."
+        )
+    if COMPOUND_THRESHOLD < 1.0:
+        warnings.append(
+            f"COMPOUND_THRESHOLD ${COMPOUND_THRESHOLD:.2f} is very small — "
+            f"compounding will fire on almost every scan."
+        )
+    if MAX_POSITIONS > 1 and POSITION_SIZE_USDC * MAX_POSITIONS > MAX_TOTAL_USDC * 1.01:
+        warnings.append(
+            "POSITION_SIZE_USDC × MAX_POSITIONS exceeds MAX_TOTAL_USDC. "
+            "The capital cap will prevent filling all slots simultaneously."
+        )
+    return warnings
