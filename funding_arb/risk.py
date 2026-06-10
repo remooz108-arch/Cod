@@ -201,15 +201,18 @@ class RiskManager:
                 self._rate_history[key] = deque(maxlen=window)
             self._rate_history[key].append(rate)
 
-    def is_rate_stable(self, exchange: str, base: str) -> bool:
-        """True if the last RATE_STABILITY_SCANS observations were all above MIN_FUNDING_RATE."""
+    def is_rate_stable(self, exchange: str, base: str, direction: str = "long") -> bool:
+        """True if the last RATE_STABILITY_SCANS observations all clear the entry threshold."""
         if not config.RATE_STABILITY_ENABLED:
             return True
         with self._lock:
             hist = self._rate_history.get(f"{exchange}:{base}")
             if not hist or len(hist) < config.RATE_STABILITY_SCANS:
                 return False
-            return all(r >= config.MIN_FUNDING_RATE for r in list(hist)[-config.RATE_STABILITY_SCANS:])
+            recent = list(hist)[-config.RATE_STABILITY_SCANS:]
+            if direction == "short":
+                return all(r <= -config.MIN_NEGATIVE_FUNDING_RATE for r in recent)
+            return all(r >= config.MIN_FUNDING_RATE for r in recent)
 
     def rate_stats(self, exchange: str, base: str) -> tuple[float, float, int]:
         """Return (mean, std, count) of the rolling rate history for an asset."""
@@ -276,8 +279,10 @@ class RiskManager:
         with self._lock:
             key   = f"{exchange}:{base}:{direction}"
             until = self._cooldowns.get(key)
-            # Support old-format keys (no direction suffix) for state backward compat.
-            if until is None:
+            # Support old-format keys (no direction suffix) written by pre-upgrade state.
+            # Only apply the bare key to "long" queries — inverse arb must never be blocked
+            # by a cooldown that was recorded for a long position.
+            if until is None and direction == "long":
                 until = self._cooldowns.get(f"{exchange}:{base}")
             if until is None:
                 return False, 0.0

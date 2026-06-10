@@ -392,7 +392,9 @@ def place_spot_short(ex: Any, base: str, usdc_amount: float) -> dict:
     """Open a cross-margin short on spot for inverse funding harvesting."""
     symbol = get_spot_symbol(ex.id, base)
     ticker = ex.fetch_ticker(symbol)
-    price  = ticker["bid"]
+    # Use ask (or last as fallback) for notional sizing — consistent with buy-side
+    # and avoids None on thin markets where bid may not be populated.
+    price  = ticker.get("ask") or ticker.get("last") or ticker["bid"]
     qty    = ex.amount_to_precision(symbol, usdc_amount / price)
     return ex.create_market_sell_order(
         symbol, float(qty), params={"marginMode": "cross", "type": "margin"}

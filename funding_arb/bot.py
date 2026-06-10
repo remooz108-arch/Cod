@@ -505,9 +505,9 @@ def open_inverse_position(
         )
         return
 
-    # Rate stability: require same N-scan confirmation as normal entries.
-    if not risk.is_rate_stable(ex_name, rate.base):
-        log(f"  Skip [inverse] {ex_name}:{rate.base} — awaiting stable scans")
+    # Rate stability: require N consecutive scans at or below -MIN_NEGATIVE_FUNDING_RATE.
+    if not risk.is_rate_stable(ex_name, rate.base, direction="short"):
+        log(f"  Skip [inverse] {ex_name}:{rate.base} — awaiting stable negative scans")
         return
 
     half         = pos_size / 2
@@ -848,6 +848,9 @@ def run(live: bool = False, no_ui: bool = False) -> None:
                         live=config.LIVE_TRADING,
                     )
                     risk.save_state()
+
+                # Refresh open_ids so inverse loop sees positions opened above.
+                open_ids = {p.id for p in risk.open_positions()}
 
                 # Inverse entries — negative funding harvesting
                 for rate in neg_rates:
