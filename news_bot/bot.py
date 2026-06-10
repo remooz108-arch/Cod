@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Geopolitical News Signal Bot
-------------------------------
-Continuously scans news RSS feeds (+ optional NewsAPI) for articles
-containing "Trump", "Iran", AND "Israel". When all three appear in the
-same article, it buys XLE (oil ETF) and GLD (gold ETF) with 1:1
-bracket orders on Alpaca.
+Trump + Iran + Israel Headline Prediction Bot
+----------------------------------------------
+Polls major news RSS feeds every POLL_INTERVAL seconds.
+If a single headline contains "Trump", "Iran", AND "Israel",
+the bot searches Polymarket for related prediction markets and
+places YES bets on them.
 
 Usage:
-    python bot.py           # dry-run, polls every POLL_INTERVAL seconds
-    python bot.py --live    # submits real (paper or live) orders
-    python bot.py --once    # single scan, then exit (good for testing)
+    python bot.py              # dry-run loop
+    python bot.py --once       # single scan, then exit
+    python bot.py --live       # place real bets
+    python bot.py --scan-only  # print headlines + markets, never bet
 """
 
 import argparse
@@ -21,18 +22,9 @@ from datetime import datetime
 from pathlib import Path
 
 import config
-from news_scanner import fetch_all_articles, Article
-from signal import find_signals, highlight
-from trades import build_trade, summarise as trade_summary
-from broker import (
-    make_trading_client,
-    make_data_client,
-    get_price,
-    market_is_open,
-    has_open_position,
-    place_bracket_order,
-    account_equity,
-)
+from headlines import fetch_headlines, find_triggered, Headline
+from market_finder import find_markets, display as display_markets
+from bettor import init_client, place_yes_bet
 
 
 def ts() -> str:
@@ -40,163 +32,146 @@ def ts() -> str:
 
 
 def load_seen() -> set[str]:
-    p = Path(config.SEEN_ARTICLES_FILE)
-    if p.exists():
-        return set(json.loads(p.read_text()))
-    return set()
+    p = Path(config.SEEN_FILE)
+    return set(json.loads(p.read_text())) if p.exists() else set()
 
 
 def save_seen(seen: set[str]) -> None:
-    Path(config.SEEN_ARTICLES_FILE).write_text(json.dumps(list(seen)))
+    Path(config.SEEN_FILE).write_text(json.dumps(list(seen)))
 
 
-def load_cooldowns() -> dict[str, float]:
-    p = Path("cooldowns.json")
-    if p.exists():
-        return json.loads(p.read_text())
-    return {}
+def log_signal(headline: Headline, markets_found: int, bets_placed: int) -> None:
+    with open(config.SIGNALS_LOG, "a") as f:
+        f.write(
+            f"\n[{ts()}] SIGNAL\n"
+            f"  Headline : {headline.title}\n"
+            f"  Source   : {headline.source}\n"
+            f"  URL      : {headline.url}\n"
+            f"  Markets  : {markets_found} found\n"
+            f"  Bets     : {bets_placed} placed\n"
+        )
 
 
-def save_cooldowns(cd: dict[str, float]) -> None:
-    Path("cooldowns.json").write_text(json.dumps(cd))
+def handle_signal(headline: Headline, client, live: bool, scan_only: bool) -> None:
+    print(f"\n{'!'*60}")
+    print(f"  SIGNAL FIRED")
+    print(f"  Source   : {headline.source}")
+    print(f"  Headline : {headline.title}")
+    print(f"  URL      : {headline.url}")
+    print(f"{'!'*60}\n")
 
+    print("  Searching Polymarket for related prediction markets...")
+    markets = find_markets()
+    print(f"  Found {len(markets)} market(s):\n")
+    print(display_markets(markets))
+    print()
 
-def log_signal(article: Article) -> None:
-    with open(config.LOG_FILE, "a") as f:
-        f.write(f"\n[{ts()}] SIGNAL FIRED\n")
-        f.write(f"  {article.source}: {article.title}\n")
-        f.write(f"  {article.url}\n")
-
-
-def run_scan(
-    trading_client,
-    data_client,
-    seen: set[str],
-    cooldowns: dict[str, float],
-) -> None:
-    print(f"\n[{ts()}] Scanning {len(config.RSS_FEEDS)} RSS feeds"
-          + (" + NewsAPI" if config.NEWS_API_KEY else "") + "...")
-
-    articles = fetch_all_articles()
-    print(f"  Fetched {len(articles)} articles total.")
-
-    new_articles = [a for a in articles if a.id not in seen]
-    print(f"  {len(new_articles)} new (unseen) articles.")
-
-    signals = find_signals(new_articles)
-
-    # Mark all new articles as seen regardless of signal
-    for a in new_articles:
-        seen.add(a.id)
-    save_seen(seen)
-
-    if not signals:
-        print("  No matching articles found this scan.")
+    if not markets:
+        log_signal(headline, 0, 0)
         return
 
-    print(f"\n  *** {len(signals)} SIGNAL(S) DETECTED ***")
-    for article in signals:
-        print(f"\n{highlight(article)}")
-        log_signal(article)
-
-    # Only trade if market is open
-    if not market_is_open(trading_client):
-        print("  Market is closed — signal logged but no orders placed.")
+    if scan_only:
+        print("  [scan-only] Skipping bets.")
+        log_signal(headline, len(markets), 0)
         return
 
-    now = time.time()
-
-    for symbol in config.SIGNAL_TICKERS:
-        # Check cooldown
-        last_trade = cooldowns.get(symbol, 0)
-        if now - last_trade < config.TRADE_COOLDOWN:
-            remaining = int(config.TRADE_COOLDOWN - (now - last_trade))
-            print(f"  [{symbol}] Cooldown active — {remaining}s remaining, skipping.")
+    bets_placed = 0
+    for market in markets:
+        if market.yes_price is None:
+            print(f"  [{market.question[:50]}] — no price data, skipping")
             continue
 
-        # Check for existing position
-        if has_open_position(trading_client, symbol):
-            print(f"  [{symbol}] Already have an open position, skipping.")
+        # Only bet YES if market isn't already near certainty
+        if market.yes_price > 0.90:
+            print(f"  [{market.question[:50]}] — YES already at {market.yes_price:.3f}, skipping")
             continue
 
-        # Fetch current price
-        price = get_price(data_client, symbol)
-        if price == 0:
-            print(f"  [{symbol}] Could not fetch price, skipping.")
-            continue
+        print(f"  Bet YES on: {market.question[:60]}")
+        print(f"    Token  : {market.yes_token_id[:20]}...")
+        print(f"    Price  : {market.yes_price:.3f}  |  Amount: ${config.BET_AMOUNT_USDC:.2f} USDC")
 
-        setup = build_trade(symbol, price)
-        if setup is None:
-            print(f"  [{symbol}] Could not build trade setup, skipping.")
-            continue
+        if not live or client is None:
+            print(f"    [dry-run] Would place FOK YES order.")
+        else:
+            try:
+                resp = place_yes_bet(client, market.yes_token_id, config.BET_AMOUNT_USDC)
+                status = resp.get("status", "unknown")
+                order_id = resp.get("orderID") or resp.get("id", "n/a")
+                print(f"    Order placed: status={status}  id={order_id}")
+                bets_placed += 1
+            except Exception as exc:
+                print(f"    ERROR placing bet: {exc}")
 
-        print(f"\n  Trade setup for {symbol}:")
-        print(trade_summary(setup))
-
-        if not config.LIVE_ORDERS:
-            print(f"  [dry-run] Would submit bracket BUY order for {symbol}.")
-            print(f"            Set LIVE_ORDERS=true (or --live) to execute.\n")
-            continue
-
-        try:
-            order = place_bracket_order(trading_client, setup)
-            cooldowns[symbol] = now
-            save_cooldowns(cooldowns)
-            print(f"  ORDER SUBMITTED: {order.id}  status={order.status}")
-        except Exception as exc:
-            print(f"  ERROR placing order for {symbol}: {exc}")
+    log_signal(headline, len(markets), bets_placed)
+    print()
 
 
-def run(live_override: bool = False, once: bool = False):
-    if live_override:
-        config.LIVE_ORDERS = True
-
-    mode = "LIVE" if config.LIVE_ORDERS else "DRY-RUN"
+def run(live: bool = False, once: bool = False, scan_only: bool = False) -> None:
+    mode = "LIVE" if live else "DRY-RUN"
     print(f"\n{'='*60}")
-    print(f"  Geopolitical News Signal Bot  [{mode}]")
+    print(f"  Trump + Iran + Israel Headline Prediction Bot  [{mode}]")
     print(f"{'='*60}")
-    print(f"  Keywords  : {' + '.join(config.REQUIRED_KEYWORDS)}")
-    print(f"  Tickers   : {', '.join(config.SIGNAL_TICKERS)}")
-    print(f"  Interval  : every {config.POLL_INTERVAL}s")
-    print(f"  Mode      : {'paper' if config.PAPER else 'LIVE'} Alpaca")
-    print(f"{'='*60}")
+    print(f"  Trigger words : {' + '.join(config.TRIGGER_WORDS)}")
+    print(f"  Matching on   : headline titles only")
+    print(f"  RSS sources   : {len(config.RSS_FEEDS)}")
+    print(f"  Bet amount    : ${config.BET_AMOUNT_USDC:.2f} USDC per market")
+    print(f"  Poll interval : {config.POLL_INTERVAL}s")
+    print(f"  Signals log   : {config.SIGNALS_LOG}")
+    print(f"{'='*60}\n")
 
-    if not config.ALPACA_API_KEY or not config.ALPACA_SECRET_KEY:
-        print("\n  ERROR: ALPACA_API_KEY / ALPACA_SECRET_KEY not set in .env")
-        sys.exit(1)
-
-    trading_client = make_trading_client()
-    data_client = make_data_client()
-
-    equity = account_equity(trading_client)
-    print(f"\n  Account equity : ${equity:,.2f}")
-    print(f"  Risk/trade     : ${config.RISK_PER_TRADE_USD:.2f}")
-    print(f"  Cooldown       : {config.TRADE_COOLDOWN}s between trades per ticker\n")
+    client = None
+    if live and not scan_only:
+        if not config.POLY_PRIVATE_KEY or config.POLY_PRIVATE_KEY.startswith("0x_your"):
+            print("  ERROR: POLY_PRIVATE_KEY not set. Cannot place live bets.")
+            sys.exit(1)
+        print("  Authenticating with Polymarket...")
+        client = init_client()
+        if client is None:
+            print("  ERROR: Authentication failed.")
+            sys.exit(1)
+        print("  Authenticated.\n")
 
     seen = load_seen()
-    cooldowns = load_cooldowns()
+    print(f"  Loaded {len(seen)} previously seen headline IDs.\n")
 
-    print(f"  Loaded {len(seen)} previously seen article IDs.")
-    print(f"  Signals will be logged to: {config.LOG_FILE}\n")
+    def scan() -> None:
+        print(f"[{ts()}] Scanning {len(config.RSS_FEEDS)} RSS feeds for headlines...")
+        all_headlines = fetch_headlines()
+        new_headlines = [h for h in all_headlines if h.id not in seen]
+        print(f"  {len(all_headlines)} total, {len(new_headlines)} new")
+
+        triggered = find_triggered(new_headlines)
+
+        for h in new_headlines:
+            seen.add(h.id)
+        save_seen(seen)
+
+        if not triggered:
+            print(f"  No matching headlines this scan.")
+            return
+
+        for headline in triggered:
+            handle_signal(headline, client, live=live, scan_only=scan_only)
 
     if once:
-        run_scan(trading_client, data_client, seen, cooldowns)
+        scan()
         return
 
     print(f"  Running continuously. Press Ctrl+C to stop.\n")
     while True:
         try:
-            run_scan(trading_client, data_client, seen, cooldowns)
-            print(f"\n  Next scan in {config.POLL_INTERVAL}s...")
+            scan()
+            print(f"  Next scan in {config.POLL_INTERVAL}s...\n")
             time.sleep(config.POLL_INTERVAL)
         except KeyboardInterrupt:
-            print("\n\n  Stopped by user. Exiting.")
+            print("\n\n  Stopped.")
             break
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Geopolitical news signal trading bot")
-    parser.add_argument("--live", action="store_true", help="Submit real orders")
-    parser.add_argument("--once", action="store_true", help="Single scan then exit")
+    parser = argparse.ArgumentParser(description="Trump+Iran+Israel headline prediction bot")
+    parser.add_argument("--live",      action="store_true", help="Place real bets on Polymarket")
+    parser.add_argument("--once",      action="store_true", help="Single scan then exit")
+    parser.add_argument("--scan-only", action="store_true", dest="scan_only", help="Find markets but never bet")
     args = parser.parse_args()
-    run(live_override=args.live, once=args.once)
+    run(live=args.live, once=args.once, scan_only=args.scan_only)
