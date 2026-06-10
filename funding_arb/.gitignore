@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Bot runtime state & data (never commit live trading data)
+funding_arb_state.json
+funding_arb_state.json.tmp
+funding_arb_trades.csv
+funding_arb_equity.csv
+
+# Secrets
+.env
