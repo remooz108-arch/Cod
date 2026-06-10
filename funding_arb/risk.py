@@ -9,21 +9,78 @@ Rules:
   - Auto-compound: position size grows 10% for every COMPOUND_THRESHOLD earned
   - Spike detection: alert when any rate exceeds SPIKE_ALERT_RATE
   - Daily stats reset at UTC midnight
+  - State persisted to JSON so the bot recovers gracefully after a restart
 """
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 from datetime import datetime, date, timezone
 from typing import Optional
 
 import config
-from models import Position, DailyStats, RateSpike
+from models import Position, DailyStats, RateSpike, _utcnow
+
+
+def _pos_to_dict(pos: Position) -> dict:
+    return {
+        "id":                pos.id,
+        "exchange":          pos.exchange,
+        "base":              pos.base,
+        "spot_symbol":       pos.spot_symbol,
+        "perp_symbol":       pos.perp_symbol,
+        "spot_exchange":     pos.spot_exchange,
+        "spot_qty":          pos.spot_qty,
+        "perp_qty":          pos.perp_qty,
+        "entry_spot_price":  pos.entry_spot_price,
+        "entry_perp_price":  pos.entry_perp_price,
+        "size_usdc":         pos.size_usdc,
+        "opened_at":         pos.opened_at.isoformat(),
+        "funding_collected": pos.funding_collected,
+        "funding_periods":   pos.funding_periods,
+        "last_rate_8h":      pos.last_rate_8h,
+        "spot_order_id":     pos.spot_order_id,
+        "perp_order_id":     pos.perp_order_id,
+        "last_period_at":    pos.last_period_at.isoformat() if pos.last_period_at else None,
+    }
+
+
+def _pos_from_dict(d: dict) -> Position:
+    def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+        if not s:
+            return None
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    return Position(
+        id               = d["id"],
+        exchange         = d["exchange"],
+        base             = d["base"],
+        spot_symbol      = d["spot_symbol"],
+        perp_symbol      = d["perp_symbol"],
+        spot_exchange    = d.get("spot_exchange", d["exchange"]),
+        spot_qty         = float(d["spot_qty"]),
+        perp_qty         = float(d["perp_qty"]),
+        entry_spot_price = float(d["entry_spot_price"]),
+        entry_perp_price = float(d["entry_perp_price"]),
+        size_usdc        = float(d["size_usdc"]),
+        opened_at        = _parse_dt(d["opened_at"]),
+        funding_collected= float(d.get("funding_collected", 0)),
+        funding_periods  = int(d.get("funding_periods", 0)),
+        last_rate_8h     = float(d.get("last_rate_8h", 0)),
+        spot_order_id    = d.get("spot_order_id"),
+        perp_order_id    = d.get("perp_order_id"),
+        last_period_at   = _parse_dt(d.get("last_period_at")),
+    )
 
 
 class RiskManager:
     def __init__(self):
-        self._lock = threading.RLock()  # reentrant: get_stats() calls several sub-methods
+        self._lock = threading.RLock()  # reentrant: get_stats() calls helper methods
         self._positions: dict[str, Position] = {}
         self._closed_positions: list[Position] = []
         self._total_funding_earned: float = 0.0
@@ -37,7 +94,7 @@ class RiskManager:
 
         # Spike tracking
         self._recent_spikes: list[RateSpike] = []
-        self._spike_seen: set[str] = set()   # reset daily
+        self._spike_seen: set[str] = set()
 
     # ── Daily reset ───────────────────────────────────────────────────────────
 
@@ -45,18 +102,18 @@ class RiskManager:
         today = datetime.now(timezone.utc).date()
         if today != self._today:
             self._daily_history.append(DailyStats(
-                date=self._today,
-                funding_earned=self._daily_earned,
-                positions_opened=self._daily_opened,
-                positions_closed=self._daily_closed,
+                date             = self._today,
+                funding_earned   = self._daily_earned,
+                positions_opened = self._daily_opened,
+                positions_closed = self._daily_closed,
             ))
-            self._daily_earned   = 0.0
-            self._daily_opened   = 0
-            self._daily_closed   = 0
-            self._spike_seen     = set()
-            self._today          = today
+            self._daily_earned  = 0.0
+            self._daily_opened  = 0
+            self._daily_closed  = 0
+            self._spike_seen    = set()
+            self._today         = today
 
-    # ── Internal helper ───────────────────────────────────────────────────────
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _compound_steps(self) -> int:
         if config.COMPOUND_THRESHOLD <= 0:
@@ -67,12 +124,15 @@ class RiskManager:
 
     def effective_position_size(self) -> float:
         """Position size grows 10% for each COMPOUND_THRESHOLD earned.
-        Cap at MAX_TOTAL_USDC so a single position never exceeds total capital.
-        can_open() enforces the hard capital check; this just controls sizing."""
+
+        Capped at MAX_TOTAL_USDC / 3 so at minimum 3 positions can always
+        coexist even at maximum compound. can_open() enforces the total
+        capital hard cap independently.
+        """
         if not config.COMPOUND_ENABLED or config.COMPOUND_THRESHOLD <= 0:
             return config.POSITION_SIZE_USDC
         raw = config.POSITION_SIZE_USDC * (1.10 ** self._compound_steps())
-        return min(raw, config.MAX_TOTAL_USDC)
+        return min(raw, config.MAX_TOTAL_USDC / 3)
 
     def compound_progress(self) -> tuple[float, float]:
         """(earned_in_current_cycle, threshold) for progress display."""
@@ -97,10 +157,10 @@ class RiskManager:
                     if key not in self._spike_seen:
                         self._spike_seen.add(key)
                         spike = RateSpike(
-                            exchange=r.exchange,
-                            base=r.base,
-                            rate_8h=r.rate_8h,
-                            apy=r.apy,
+                            exchange = r.exchange,
+                            base     = r.base,
+                            rate_8h  = r.rate_8h,
+                            apy      = r.apy,
                         )
                         self._recent_spikes.append(spike)
                         self._recent_spikes = self._recent_spikes[-10:]
@@ -118,8 +178,8 @@ class RiskManager:
                 return False, f"Already have {pid} open"
             if len(self._positions) >= config.MAX_POSITIONS:
                 return False, f"Max positions ({config.MAX_POSITIONS}) reached"
-            size = size_override if size_override is not None else self.effective_position_size()
-            deployed = self.total_deployed()
+            size     = size_override if size_override is not None else self.effective_position_size()
+            deployed = sum(p.size_usdc for p in self._positions.values())
             if deployed + size > config.MAX_TOTAL_USDC:
                 return False, (
                     f"Capital cap: ${deployed:.0f} + ${size:.0f} "
@@ -147,14 +207,25 @@ class RiskManager:
             self._positions[pos.id] = pos
             self._daily_opened += 1
 
-    def record_funding(self, pos_id: str, amount: float, rate: float) -> None:
+    def update_rate(self, pos_id: str, rate: float) -> None:
+        """Update last_rate_8h for display; does NOT count a funding period."""
+        with self._lock:
+            if pos_id in self._positions:
+                self._positions[pos_id].last_rate_8h = rate
+
+    def record_funding(
+        self, pos_id: str, amount: float, rate: float, period_at: Optional[datetime] = None
+    ) -> None:
+        """Record one completed 8-hour funding period."""
         with self._lock:
             self._maybe_reset_daily()
             if pos_id in self._positions:
                 p = self._positions[pos_id]
-                p.funding_collected += amount
-                p.funding_periods   += 1
-                p.last_rate_8h       = rate
+                p.funding_collected      += amount
+                p.funding_periods        += 1
+                p.last_rate_8h            = rate
+                if period_at is not None:
+                    p.last_period_at      = period_at
                 self._total_funding_earned += amount
                 self._daily_earned         += amount
 
@@ -197,7 +268,7 @@ class RiskManager:
     def get_stats(self) -> dict:
         with self._lock:
             self._maybe_reset_daily()
-            positions = list(self._positions.values())
+            positions  = list(self._positions.values())
             cycle, threshold = self.compound_progress()
             return {
                 "open_positions":          len(positions),
@@ -215,3 +286,39 @@ class RiskManager:
                 "compound_threshold":      threshold,
                 "recent_spikes":           list(self._recent_spikes[-3:]),
             }
+
+    # ── State persistence ─────────────────────────────────────────────────────
+
+    def save_state(self, path: str = "") -> None:
+        """Atomically write open positions to disk (rename from temp file)."""
+        path = path or config.STATE_FILE
+        with self._lock:
+            state = {
+                "total_funding_earned": self._total_funding_earned,
+                "positions": [_pos_to_dict(p) for p in self._positions.values()],
+            }
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w") as fh:
+                json.dump(state, fh, indent=2)
+            os.replace(tmp, path)
+        except Exception as exc:
+            print(f"  [warn] state save failed: {exc}")
+
+    def load_state(self, path: str = "") -> int:
+        """Load persisted positions. Returns number of positions restored."""
+        path = path or config.STATE_FILE
+        if not os.path.exists(path):
+            return 0
+        try:
+            with open(path) as fh:
+                state = json.load(fh)
+            with self._lock:
+                self._total_funding_earned = float(state.get("total_funding_earned", 0))
+                for d in state.get("positions", []):
+                    pos = _pos_from_dict(d)
+                    self._positions[pos.id] = pos
+            return len(state.get("positions", []))
+        except Exception as exc:
+            print(f"  [warn] state load failed: {exc}")
+            return 0

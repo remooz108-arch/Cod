@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from rich.console import Console
@@ -40,7 +40,7 @@ def render(
     start_time: datetime,
     live_mode: bool,
 ) -> Panel:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     up  = now - start_time
     h, rem = divmod(int(up.total_seconds()), 3600)
     m, s   = divmod(rem, 60)
@@ -196,7 +196,7 @@ class Dashboard:
         self._live_mode   = live_mode
         self._top_rates: list = []
         self._scan_count  = 0
-        self._start_time  = datetime.utcnow()
+        self._start_time  = datetime.now(timezone.utc)
         self._running     = False
         self._thread: threading.Thread | None = None
 

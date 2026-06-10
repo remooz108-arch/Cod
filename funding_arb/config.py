@@ -26,6 +26,11 @@ MAX_TOTAL_USDC     = float(os.getenv("MAX_TOTAL_USDC", "5000"))
 SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL", "60"))
 LIVE_TRADING       = os.getenv("LIVE_TRADING", "false").lower() == "true"
 
+# ── State persistence ─────────────────────────────────────────────────────────
+# Written on every position open/close so the bot can resume after a restart
+# without losing track of what is open on the exchanges.
+STATE_FILE         = os.getenv("STATE_FILE", "./funding_arb_state.json")
+
 # ── Altcoin filters ─────────────────────────────────────────────────────────
 # Comma-separated list of base assets to never trade (rug-prone, zero-liquidity)
 _USER_BLACKLIST = set(b.upper() for b in os.getenv("BLACKLIST_BASES", "").split(",") if b)

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Optional
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass
@@ -63,7 +67,7 @@ class RateSpike:
     base: str
     rate_8h: float
     apy: float
-    detected_at: datetime = field(default_factory=datetime.utcnow)
+    detected_at: datetime = field(default_factory=_utcnow)
 
     def __str__(self) -> str:
         return (
@@ -77,4 +81,4 @@ class ExchangeSnapshot:
     exchange: str
     rates: list[FundingRate] = field(default_factory=list)
     error: Optional[str] = None
-    fetched_at: datetime = field(default_factory=datetime.utcnow)
+    fetched_at: datetime = field(default_factory=_utcnow)

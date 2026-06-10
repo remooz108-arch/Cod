@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import config
 from exchanges import (
@@ -54,7 +54,7 @@ from dashboard import Dashboard
 
 
 def ts() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
 def log(msg: str) -> None:
@@ -138,7 +138,7 @@ def open_position(
         entry_spot_price=rate.mark_price,
         entry_perp_price=rate.mark_price,
         size_usdc=pos_size,
-        opened_at=datetime.utcnow(),
+        opened_at=datetime.now(timezone.utc),
         last_rate_8h=rate.rate_8h,
         spot_order_id=spot_order_id,
         perp_order_id=perp_order_id,
@@ -156,7 +156,15 @@ def close_position(
     spot_ex = exchanges.get(pos.spot_exchange)
     perp_ex = exchanges.get(pos.exchange)
 
-    if live and spot_ex and perp_ex:
+    if live:
+        if not spot_ex or not perp_ex:
+            # Cannot close without both exchange objects — leave position open
+            # and do NOT remove it from RiskManager so the next scan retries.
+            missing = pos.spot_exchange if not spot_ex else pos.exchange
+            log(f"    ABORT close: exchange '{missing}' not in exchanges dict. "
+                f"Position remains open. Check your API keys.")
+            return
+
         try:
             close_spot_position(spot_ex, pos.base, pos.spot_qty)
             log(f"    Spot SELL {pos.spot_qty:.6f} {pos.base} done")
@@ -183,7 +191,7 @@ _EIGHT_HOURS_S = 8 * 3600
 def accrue_funding(
     positions: list[Position], exchanges: dict, risk: RiskManager
 ) -> None:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     for pos in positions:
         ex = exchanges.get(pos.exchange)
         if not ex:
@@ -192,14 +200,14 @@ def accrue_funding(
         if rate is None:
             continue
 
-        pos.last_rate_8h = rate
+        # Always update the displayed rate — done under lock via update_rate().
+        risk.update_rate(pos.id, rate)
 
-        # Only increment funding_periods once per 8-hour funding window.
-        # Exchange credits the payment automatically; we just track the count.
+        # Count a funding period only when 8 hours have elapsed.
+        # Exchange credits the payment to the margin balance automatically.
         baseline = pos.last_period_at if pos.last_period_at is not None else pos.opened_at
         if (now - baseline).total_seconds() >= _EIGHT_HOURS_S:
-            risk.record_funding(pos.id, 0.0, rate)
-            pos.last_period_at = now
+            risk.record_funding(pos.id, 0.0, rate, period_at=now)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -232,7 +240,15 @@ def run(live: bool = False, no_ui: bool = False) -> None:
     exchanges = build_exchanges()
     log(f"Connected: {', '.join(exchanges.keys())}\n")
 
-    risk      = RiskManager()
+    risk = RiskManager()
+
+    # Restore any positions that were open before the last restart.
+    restored = risk.load_state()
+    if restored:
+        log(f"Restored {restored} position(s) from {config.STATE_FILE}")
+    else:
+        log(f"No saved state found — starting fresh")
+
     dashboard = None if no_ui else Dashboard(risk, live_mode=config.LIVE_TRADING)
     if dashboard:
         dashboard.start()
@@ -269,8 +285,11 @@ def run(live: bool = False, no_ui: bool = False) -> None:
             for spike in new_spikes:
                 log(f"  ⚡ SPIKE ALERT: {spike}")
 
+            # Snapshot once per scan to avoid redundant lock+copy calls.
+            positions = risk.open_positions()
+
             # ── Check exits on open positions ─────────────────────────────────
-            for pos in risk.open_positions():
+            for pos in positions:
                 ex           = exchanges.get(pos.exchange)
                 current_rate = fetch_current_funding_rate(ex, pos.perp_symbol) if ex else None
                 should, reason = risk.should_exit(pos, current_rate)
@@ -279,21 +298,23 @@ def run(live: bool = False, no_ui: bool = False) -> None:
                         pos, exchanges, risk,
                         live=config.LIVE_TRADING, reason=reason,
                     )
+                    risk.save_state()
 
             # ── Accrue funding ────────────────────────────────────────────────
-            accrue_funding(risk.open_positions(), exchanges, risk)
+            accrue_funding(positions, exchanges, risk)
 
             # ── Open new positions ────────────────────────────────────────────
+            open_ids = {p.id for p in positions}
             for rate in top_rates:
                 if rate.rate_8h < config.MIN_FUNDING_RATE:
                     break  # sorted descending
-                pos_id = f"{rate.exchange}:{rate.base}"
-                if any(p.id == pos_id for p in risk.open_positions()):
+                if f"{rate.exchange}:{rate.base}" in open_ids:
                     continue
                 open_position(
                     rate.exchange, exchanges, rate, risk,
                     live=config.LIVE_TRADING,
                 )
+                risk.save_state()
 
             # ── Compound progress log ─────────────────────────────────────────
             if no_ui:
