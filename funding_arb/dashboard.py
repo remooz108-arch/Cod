@@ -62,7 +62,6 @@ def render(
     pnl        = stats["total_funding_earned"]
     daily      = stats["daily_earned"]
     pnl_color  = "green" if pnl >= 0 else "red"
-    daily_pct  = min(daily / max(config.TARGET_DAILY_USDC, 0.01) * 100, 100)
     bar        = _bar(daily, config.TARGET_DAILY_USDC)
     eff_size   = stats["effective_position_size"]
     c_step     = stats["compound_step"]

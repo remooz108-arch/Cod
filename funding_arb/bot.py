@@ -153,17 +153,18 @@ def close_position(
     pos: Position, exchanges: dict, risk: RiskManager, live: bool, reason: str
 ) -> None:
     log(f"  EXITING {pos.id} — {reason}")
-    ex = exchanges.get(pos.exchange)
+    spot_ex = exchanges.get(pos.spot_exchange)
+    perp_ex = exchanges.get(pos.exchange)
 
-    if live and ex:
+    if live and spot_ex and perp_ex:
         try:
-            close_spot_position(ex, pos.base, pos.spot_qty)
+            close_spot_position(spot_ex, pos.base, pos.spot_qty)
             log(f"    Spot SELL {pos.spot_qty:.6f} {pos.base} done")
         except Exception as exc:
             log(f"    ERROR closing spot: {exc}")
 
         try:
-            close_perp_position(ex, pos.perp_symbol, pos.perp_qty)
+            close_perp_position(perp_ex, pos.perp_symbol, pos.perp_qty)
             log(f"    Perp BUY-BACK {pos.perp_qty:.6f} done")
         except Exception as exc:
             log(f"    ERROR closing perp: {exc}")
@@ -176,9 +177,13 @@ def close_position(
 
 # ── Funding accrual ───────────────────────────────────────────────────────────
 
+_EIGHT_HOURS_S = 8 * 3600
+
+
 def accrue_funding(
     positions: list[Position], exchanges: dict, risk: RiskManager
 ) -> None:
+    now = datetime.utcnow()
     for pos in positions:
         ex = exchanges.get(pos.exchange)
         if not ex:
@@ -186,10 +191,15 @@ def accrue_funding(
         rate = fetch_current_funding_rate(ex, pos.perp_symbol)
         if rate is None:
             continue
-        # amount=0: exchange credits funding to margin balance automatically.
-        # We track periods and last rate for display; real P&L = margin delta.
-        risk.record_funding(pos.id, 0.0, rate)
+
         pos.last_rate_8h = rate
+
+        # Only increment funding_periods once per 8-hour funding window.
+        # Exchange credits the payment automatically; we just track the count.
+        baseline = pos.last_period_at if pos.last_period_at is not None else pos.opened_at
+        if (now - baseline).total_seconds() >= _EIGHT_HOURS_S:
+            risk.record_funding(pos.id, 0.0, rate)
+            pos.last_period_at = now
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────

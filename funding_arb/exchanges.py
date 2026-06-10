@@ -190,10 +190,14 @@ def _extract_rate(
 def has_spot_market(ex: Any, base: str) -> bool:
     try:
         markets = getattr(ex, "markets", None) or ex.load_markets()
-        spot = f"{base}/USDT"
-        m = markets.get(spot)
-        return m is not None and m.get("type") in ("spot", None, "")
+        m = markets.get(f"{base}/USDT")
+        if m is None:
+            return False
+        mtype = m.get("type")
+        # Some exchanges leave type=None for spot markets; accept both.
+        return mtype in ("spot", None)
     except Exception:
+        # Can't verify — assume True and let the order placement handle failure.
         return True
 
 
