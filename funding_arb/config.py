@@ -82,6 +82,36 @@ MAX_BREAKEVEN_PERIODS = int(os.getenv("MAX_BREAKEVEN_PERIODS",    "12"))
 RATE_STABILITY_ENABLED = os.getenv("RATE_STABILITY_ENABLED", "true").lower() == "true"
 RATE_STABILITY_SCANS   = int(os.getenv("RATE_STABILITY_SCANS", "3"))
 
+# ── Rate consistency filter (rolling mean / volatility) ───────────────────────
+# Beyond "positive for N scans", track a longer rolling window per asset and
+# require the AVERAGE rate to clear MIN_FUNDING_RATE and the rate to be
+# CONSISTENT (low coefficient of variation = std/mean). A rate that averages
+# 0.15%/8h steadily beats one that spiked once to 0.15% but averages 0.01%.
+RATE_HISTORY_SAMPLES = int(os.getenv("RATE_HISTORY_SAMPLES", "40"))   # rolling window length
+RATE_CV_FILTER_ENABLED = os.getenv("RATE_CV_FILTER_ENABLED", "true").lower() == "true"
+MAX_RATE_CV = float(os.getenv("MAX_RATE_CV", "1.0"))                  # std/mean ceiling (1.0 = std ≤ mean)
+
+# ── Cooldown guard ────────────────────────────────────────────────────────────
+# After a position exits, block re-entry of the SAME asset for this many hours.
+# Prevents whipsawing in and out of a coin whose rate is oscillating around
+# the threshold. (Idea adapted from OpenAlice's CooldownGuard.)
+COOLDOWN_ENABLED = os.getenv("COOLDOWN_ENABLED", "true").lower() == "true"
+COOLDOWN_HOURS   = float(os.getenv("COOLDOWN_HOURS", "2"))
+
+# ── Balance-aware sizing ──────────────────────────────────────────────────────
+# When live, size each position as a fraction of REAL available exchange
+# balance rather than a fixed dollar amount — the bot self-calibrates as your
+# capital grows. Falls back to the fixed/compounded size if balance is
+# unavailable. (Idea adapted from OpenAlice's %-of-equity sizing.)
+BALANCE_AWARE_SIZING = os.getenv("BALANCE_AWARE_SIZING", "false").lower() == "true"
+BALANCE_FRACTION     = float(os.getenv("BALANCE_FRACTION", "0.10"))  # 10% of free balance per position
+
+# ── Equity curve snapshots ────────────────────────────────────────────────────
+# Append total deployed + all-time earned + open count to a CSV once per hour,
+# building a time series you can plot to watch your wealth grow.
+EQUITY_CURVE_FILE     = os.getenv("EQUITY_CURVE_FILE", "./funding_arb_equity.csv")
+EQUITY_SNAPSHOT_HOURS = float(os.getenv("EQUITY_SNAPSHOT_HOURS", "1"))
+
 # ── Trailing rate stop ────────────────────────────────────────────────────────
 TRAILING_RATE_STOP = float(os.getenv("TRAILING_RATE_STOP", "0.5"))
 

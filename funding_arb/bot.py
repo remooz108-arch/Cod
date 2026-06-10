@@ -42,6 +42,7 @@ import config
 from exchanges import (
     build_exchanges,
     fetch_all_funding_rates,
+    fetch_available_balance,
     fetch_current_funding_rate,
     fetch_margin_ratio,
     has_spot_market,
@@ -80,7 +81,7 @@ def _log_trade(pos: "Position", reason: str) -> None:
                 w.writerow([
                     "closed_at", "exchange", "base", "size_usdc",
                     "periods", "funding_collected", "apy_realised_pct",
-                    "opened_at", "duration_hours", "reason",
+                    "opened_at", "duration_hours", "reason", "entry_thesis",
                 ])
             now   = datetime.now(timezone.utc)
             hours = (
@@ -96,9 +97,39 @@ def _log_trade(pos: "Position", reason: str) -> None:
                 pos.opened_at.strftime("%Y-%m-%d %H:%M:%S UTC") if pos.opened_at else "",
                 f"{hours:.1f}" if hours != "" else "",
                 reason,
+                pos.entry_note,
             ])
     except Exception as exc:
         log(f"  [warn] trade journal write failed: {exc}")
+
+
+# ── Equity curve snapshot ─────────────────────────────────────────────────────
+
+def _snapshot_equity(risk: "RiskManager") -> None:
+    """Append a timestamped equity row to the curve CSV (for plotting growth)."""
+    path = config.EQUITY_CURVE_FILE
+    write_header = not os.path.exists(path)
+    try:
+        stats = risk.get_stats()
+        with open(path, "a", newline="") as fh:
+            w = csv.writer(fh)
+            if write_header:
+                w.writerow([
+                    "timestamp", "total_earned", "daily_earned",
+                    "total_deployed", "open_positions", "avg_apy_pct",
+                    "compound_step",
+                ])
+            w.writerow([
+                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                f"{stats['total_funding_earned']:.6f}",
+                f"{stats['daily_earned']:.6f}",
+                f"{stats['total_deployed']:.2f}",
+                stats["open_positions"],
+                f"{stats['avg_apy']:.2f}",
+                stats["compound_step"],
+            ])
+    except Exception as exc:
+        log(f"  [warn] equity snapshot write failed: {exc}")
 
 
 # ── Hedge drift check ─────────────────────────────────────────────────────────
@@ -260,6 +291,15 @@ def open_position(
         return
 
     pos_size = risk.effective_position_size()
+
+    # Balance-aware sizing (live only): size from real free balance so the bot
+    # self-calibrates as capital grows. Never exceed the compounded size cap.
+    if config.BALANCE_AWARE_SIZING and live:
+        free = fetch_available_balance(exchanges[ex_name])
+        if free is not None and free > 0:
+            balance_size = free * config.BALANCE_FRACTION
+            pos_size = min(pos_size, balance_size) if balance_size > 0 else pos_size
+
     ok, reason = risk.can_open(ex_name, rate.base, size_override=pos_size)
     if not ok:
         log(f"  Skip {ex_name}:{rate.base} — {reason}")
@@ -281,6 +321,12 @@ def open_position(
     # Rate stability filter: require the rate to have been good for N consecutive scans.
     if not risk.is_rate_stable(ex_name, rate.base):
         log(f"  Skip {ex_name}:{rate.base} — awaiting {config.RATE_STABILITY_SCANS} stable scans")
+        return
+
+    # Rate consistency filter: average must clear the floor and be steady, not flickering.
+    consistent, why = risk.is_rate_consistent(ex_name, rate.base)
+    if not consistent:
+        log(f"  Skip {ex_name}:{rate.base} — {why}")
         return
 
     half         = pos_size / 2
@@ -326,6 +372,15 @@ def open_position(
             f"+ short ${half:.2f} {rate.symbol}"
         )
 
+    # Capture the full entry thesis for the trade journal (why we entered).
+    mean, std, n  = risk.rate_stats(ex_name, rate.base)
+    breakeven_p   = (round_trip_cost / rate.rate_8h) if rate.rate_8h > 0 else 0
+    entry_note = (
+        f"rate {rate.rate_8h:.4%}/8h ({rate.apy:.0f}% APY); "
+        f"avg {mean:.4%} over {n} scans; "
+        f"breakeven {breakeven_p:.1f}p; size ${pos_size:.2f}"
+    )
+
     pos = Position(
         id=f"{ex_name}:{rate.base}",
         exchange=ex_name,
@@ -341,6 +396,7 @@ def open_position(
         opened_at=datetime.now(timezone.utc),
         last_rate_8h=rate.rate_8h,
         peak_rate_8h=rate.rate_8h,
+        entry_note=entry_note,
         spot_order_id=spot_order_id,
         perp_order_id=perp_order_id,
     )
@@ -385,6 +441,9 @@ def close_position(
     log(f"  Position closed. Funding collected: ${pos.funding_collected:.4f}")
     notify.position_closed(pos.exchange, pos.base, reason, pos.funding_collected)
     _log_trade(pos, reason)
+
+    # Block re-entry of this asset for a cooldown window to prevent whipsawing.
+    risk.start_cooldown(pos.exchange, pos.base)
 
     # Circuit breaker: count rate-flip exits (not rotations or drift exits).
     if "rate" in reason.lower() or "negative" in reason.lower() or "below" in reason.lower():
@@ -472,6 +531,8 @@ def run(live: bool = False, no_ui: bool = False) -> None:
     _summary_date = datetime.now(timezone.utc).date()
     top_rates: list = []
     _cb_notified  = False  # latch: only send circuit-breaker Telegram once per trip
+    _last_equity_snapshot = datetime.now(timezone.utc)
+    _snapshot_equity(risk)  # baseline row at startup
 
     try:
         while True:
@@ -607,6 +668,12 @@ def run(live: bool = False, no_ui: bool = False) -> None:
                     target         = config.TARGET_DAILY_USDC,
                 )
                 _summary_date = today
+
+            # ── Equity curve snapshot (hourly) ────────────────────────────────
+            now_utc = datetime.now(timezone.utc)
+            if (now_utc - _last_equity_snapshot).total_seconds() >= config.EQUITY_SNAPSHOT_HOURS * 3600:
+                _snapshot_equity(risk)
+                _last_equity_snapshot = now_utc
 
             # Scan faster when below half capacity to catch new opportunities sooner.
             utilisation = len(positions) / max(config.MAX_POSITIONS, 1)

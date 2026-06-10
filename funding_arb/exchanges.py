@@ -245,6 +245,23 @@ def fetch_current_funding_rate(ex: Any, perp_symbol: str) -> Optional[float]:
         return None
 
 
+def fetch_available_balance(ex: Any, quote: str = "USDT") -> Optional[float]:
+    """
+    Return free (available) quote-currency balance on an exchange, or None if
+    it can't be determined. Used for balance-aware position sizing.
+    """
+    try:
+        bal = ex.fetch_balance()
+        free = bal.get("free", {})
+        # Try USDT first, then USDC as a fallback quote.
+        for q in (quote, "USDC", "USD"):
+            if q in free and free[q] is not None:
+                return float(free[q])
+    except Exception:
+        pass
+    return None
+
+
 def set_leverage(ex: Any, symbol: str, leverage: int) -> None:
     """Set leverage for a perp symbol before opening a short. Silent if unsupported."""
     try:

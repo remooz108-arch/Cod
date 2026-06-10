@@ -43,6 +43,7 @@ def _pos_to_dict(pos: Position) -> dict:
         "funding_periods":   pos.funding_periods,
         "last_rate_8h":      pos.last_rate_8h,
         "peak_rate_8h":      pos.peak_rate_8h,
+        "entry_note":        pos.entry_note,
         "spot_order_id":     pos.spot_order_id,
         "perp_order_id":     pos.perp_order_id,
         "last_period_at":    pos.last_period_at.isoformat() if pos.last_period_at else None,
@@ -75,6 +76,7 @@ def _pos_from_dict(d: dict) -> Position:
         funding_periods  = int(d.get("funding_periods", 0)),
         last_rate_8h     = float(d.get("last_rate_8h", 0)),
         peak_rate_8h     = float(d.get("peak_rate_8h", d.get("last_rate_8h", 0))),
+        entry_note       = d.get("entry_note", ""),
         spot_order_id    = d.get("spot_order_id"),
         perp_order_id    = d.get("perp_order_id"),
         last_period_at   = _parse_dt(d.get("last_period_at")),
@@ -104,6 +106,9 @@ class RiskManager:
 
         # Circuit breaker: timestamps of exits caused by rate flips
         self._flip_exit_times: list[datetime] = []
+
+        # Cooldown guard: {exchange:base -> datetime re-entry is allowed again}
+        self._cooldowns: dict[str, datetime] = {}
 
     # ── Daily reset ───────────────────────────────────────────────────────────
 
@@ -179,11 +184,11 @@ class RiskManager:
     # ── Rate stability ────────────────────────────────────────────────────────
 
     def record_rate_observation(self, exchange: str, base: str, rate: float) -> None:
-        """Store the latest rate reading for the stability filter."""
+        """Store the latest rate reading for the stability and consistency filters."""
         with self._lock:
             key = f"{exchange}:{base}"
             if key not in self._rate_history:
-                window = max(config.RATE_STABILITY_SCANS + 1, 2)
+                window = max(config.RATE_HISTORY_SAMPLES, config.RATE_STABILITY_SCANS + 1, 2)
                 self._rate_history[key] = deque(maxlen=window)
             self._rate_history[key].append(rate)
 
@@ -196,6 +201,62 @@ class RiskManager:
             if not hist or len(hist) < config.RATE_STABILITY_SCANS:
                 return False
             return all(r >= config.MIN_FUNDING_RATE for r in list(hist)[-config.RATE_STABILITY_SCANS:])
+
+    def rate_stats(self, exchange: str, base: str) -> tuple[float, float, int]:
+        """Return (mean, std, count) of the rolling rate history for an asset."""
+        with self._lock:
+            hist = self._rate_history.get(f"{exchange}:{base}")
+            if not hist:
+                return 0.0, 0.0, 0
+            data = list(hist)
+            n    = len(data)
+            mean = sum(data) / n
+            var  = sum((r - mean) ** 2 for r in data) / n if n > 1 else 0.0
+            return mean, var ** 0.5, n
+
+    def is_rate_consistent(self, exchange: str, base: str) -> tuple[bool, str]:
+        """
+        True if the AVERAGE rate clears MIN_FUNDING_RATE and the rate is steady
+        (coefficient of variation below MAX_RATE_CV). Filters out flickering
+        rates that look good on a single reading but average out poorly.
+        """
+        if not config.RATE_CV_FILTER_ENABLED:
+            return True, "OK"
+        mean, std, n = self.rate_stats(exchange, base)
+        # Need a meaningful sample before judging consistency.
+        if n < config.RATE_STABILITY_SCANS:
+            return False, f"only {n} samples (need {config.RATE_STABILITY_SCANS})"
+        if mean < config.MIN_FUNDING_RATE:
+            return False, f"avg {mean:.4%} < {config.MIN_FUNDING_RATE:.4%} floor"
+        cv = (std / mean) if mean > 0 else float("inf")
+        if cv > config.MAX_RATE_CV:
+            return False, f"volatile (CV {cv:.2f} > {config.MAX_RATE_CV:.2f})"
+        return True, "OK"
+
+    # ── Cooldown guard ────────────────────────────────────────────────────────
+
+    def start_cooldown(self, exchange: str, base: str) -> None:
+        """Block re-entry of this asset for COOLDOWN_HOURS after an exit."""
+        if not config.COOLDOWN_ENABLED or config.COOLDOWN_HOURS <= 0:
+            return
+        with self._lock:
+            self._cooldowns[f"{exchange}:{base}"] = (
+                _utcnow() + timedelta(hours=config.COOLDOWN_HOURS)
+            )
+
+    def in_cooldown(self, exchange: str, base: str) -> tuple[bool, float]:
+        """Return (is_cooling_down, minutes_remaining)."""
+        if not config.COOLDOWN_ENABLED:
+            return False, 0.0
+        with self._lock:
+            until = self._cooldowns.get(f"{exchange}:{base}")
+            if until is None:
+                return False, 0.0
+            now = _utcnow()
+            if now >= until:
+                del self._cooldowns[f"{exchange}:{base}"]
+                return False, 0.0
+            return True, (until - now).total_seconds() / 60.0
 
     # ── Circuit breaker ───────────────────────────────────────────────────────
 
@@ -225,6 +286,9 @@ class RiskManager:
             pid = f"{exchange}:{base}"
             if pid in self._positions:
                 return False, f"Already have {pid} open"
+            cooling, mins = self.in_cooldown(exchange, base)
+            if cooling:
+                return False, f"Cooldown: {base} re-entry blocked {mins:.0f}m more"
             if len(self._positions) >= config.MAX_POSITIONS:
                 return False, f"Max positions ({config.MAX_POSITIONS}) reached"
             size     = size_override if size_override is not None else self.effective_position_size()
@@ -398,6 +462,9 @@ class RiskManager:
             state = {
                 "total_funding_earned": self._total_funding_earned,
                 "positions": [_pos_to_dict(p) for p in self._positions.values()],
+                "cooldowns": {
+                    k: v.isoformat() for k, v in self._cooldowns.items()
+                },
             }
         tmp = path + ".tmp"
         try:
@@ -420,6 +487,16 @@ class RiskManager:
                 for d in state.get("positions", []):
                     pos = _pos_from_dict(d)
                     self._positions[pos.id] = pos
+                now = _utcnow()
+                for k, iso in state.get("cooldowns", {}).items():
+                    try:
+                        dt = datetime.fromisoformat(iso)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if dt > now:  # drop already-expired cooldowns
+                            self._cooldowns[k] = dt
+                    except (ValueError, TypeError):
+                        continue
             return len(state.get("positions", []))
         except Exception as exc:
             print(f"  [warn] state load failed: {exc}")
