@@ -23,3 +23,30 @@ RSS_FEEDS = [
 
 MARKET_FILE = "market.json"
 LOG_FILE    = "market.log"
+
+# ── Polymarket betting (optional) ────────────────────────────────────────────
+POLY_PRIVATE_KEY    = os.getenv("POLY_PRIVATE_KEY", "")
+POLY_FUNDER_ADDRESS = os.getenv("POLY_FUNDER_ADDRESS", "")
+CLOB_HOST           = "https://clob.polymarket.com"
+GAMMA_HOST          = "https://gamma-api.polymarket.com"
+CHAIN_ID            = 137
+
+# USDC to bet per matching market when signal fires
+BET_AMOUNT_USDC = float(os.getenv("BET_AMOUNT_USDC", "10"))
+
+# Only bet on markets priced between these bounds (avoid near-certain markets)
+MIN_YES_PRICE = float(os.getenv("MIN_YES_PRICE", "0.05"))
+MAX_YES_PRICE = float(os.getenv("MAX_YES_PRICE", "0.80"))
+
+# Set to "true" to actually submit orders, "false" to print only
+LIVE_BETTING = os.getenv("LIVE_BETTING", "false").lower() == "true"
+
+# Polymarket search terms used when signal fires
+POLY_SEARCH_TERMS = [
+    "iran israel",
+    "israel iran attack",
+    "iran strike",
+    "israel attack iran",
+    "trump iran",
+    "middle east war",
+]
