@@ -53,6 +53,29 @@ COMPOUND_THRESHOLD = float(os.getenv("COMPOUND_THRESHOLD", "100"))  # reinvest p
 # ── Income target (display only) ─────────────────────────────────────────────
 TARGET_DAILY_USDC  = float(os.getenv("TARGET_DAILY_USDC", "50"))
 
+# ── Position rotation ─────────────────────────────────────────────────────────
+# When at MAX_POSITIONS, close the weakest if a new rate is ROTATION_THRESHOLD× better.
+# MIN_HOLD_PERIODS prevents churning out a position before it has covered entry costs.
+ROTATION_ENABLED    = os.getenv("ROTATION_ENABLED", "true").lower() == "true"
+ROTATION_THRESHOLD  = float(os.getenv("ROTATION_THRESHOLD", "1.5"))  # 50% better rate required
+MIN_HOLD_PERIODS    = int(os.getenv("MIN_HOLD_PERIODS", "2"))         # hold ≥2 periods (16h) before rotation
+
+# ── Per-exchange concentration cap ───────────────────────────────────────────
+# Limits how much capital can sit on a single exchange.
+# 0.5 = never more than 50% of MAX_TOTAL_USDC on one exchange.
+MAX_EXCHANGE_FRACTION = float(os.getenv("MAX_EXCHANGE_FRACTION", "0.5"))
+
+# ── Entry quality gate ────────────────────────────────────────────────────────
+# Skip entries whose rate cannot cover round-trip fees within MAX_BREAKEVEN_PERIODS.
+# Round-trip cost ≈ TAKER_FEE_PCT × 4 (entry + exit, both legs).
+# Default: must break even within 12 periods (4 days).
+TAKER_FEE_PCT         = float(os.getenv("TAKER_FEE_PCT", "0.0005"))  # 0.05% per leg
+MAX_BREAKEVEN_PERIODS = int(os.getenv("MAX_BREAKEVEN_PERIODS", "12"))
+
+# ── Telegram notifications ────────────────────────────────────────────────────
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
+
 # ── Annualised equivalents (3 × 365 = 1095 periods per year) ─────────────────
 PERIODS_PER_YEAR = 3 * 365
 

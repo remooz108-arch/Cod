@@ -51,6 +51,7 @@ from exchanges import (
 from models import Position
 from risk import RiskManager
 from dashboard import Dashboard
+import notify
 
 
 def ts() -> str:
@@ -85,6 +86,13 @@ def open_position(
     ex = exchanges[ex_name]
     if not has_spot_market(ex, rate.base):
         log(f"  Skip {ex_name}:{rate.base} — no spot market")
+        return
+
+    # Entry quality gate: skip if round-trip fees can't be recovered in time.
+    round_trip_cost = config.TAKER_FEE_PCT * 4
+    if rate.rate_8h > 0 and (round_trip_cost / rate.rate_8h) > config.MAX_BREAKEVEN_PERIODS:
+        log(f"  Skip {ex_name}:{rate.base} — breakeven "
+            f"{round_trip_cost/rate.rate_8h:.1f} periods > {config.MAX_BREAKEVEN_PERIODS} max")
         return
 
     half         = pos_size / 2
@@ -145,6 +153,7 @@ def open_position(
     )
     risk.record_open(pos)
     log(f"  Position opened: {pos.id}  (${pos_size:.0f} USDC deployed)")
+    notify.position_opened(ex_name, rate.base, pos_size, rate.rate_8h, rate.apy)
 
 
 # ── Exit ──────────────────────────────────────────────────────────────────────
@@ -181,6 +190,7 @@ def close_position(
 
     risk.record_close(pos.id)
     log(f"  Position closed. Funding collected: ${pos.funding_collected:.4f}")
+    notify.position_closed(pos.exchange, pos.base, reason, pos.funding_collected)
 
 
 # ── Funding accrual ───────────────────────────────────────────────────────────
@@ -254,6 +264,7 @@ def run(live: bool = False, no_ui: bool = False) -> None:
         dashboard.start()
 
     scan_count = 0
+    _summary_date = datetime.now(timezone.utc).date()
     top_rates: list = []
 
     try:
@@ -284,9 +295,42 @@ def run(live: bool = False, no_ui: bool = False) -> None:
             new_spikes = risk.check_spikes(top_rates)
             for spike in new_spikes:
                 log(f"  ⚡ SPIKE ALERT: {spike}")
+            for spike in new_spikes:
+                notify.spike_alert(spike.exchange, spike.base, spike.rate_8h, spike.apy)
 
             # Snapshot once per scan to avoid redundant lock+copy calls.
             positions = risk.open_positions()
+            open_ids  = {p.id for p in positions}
+
+            # ── Position rotation ─────────────────────────────────────────────
+            # If at capacity, swap out the weakest position for a meaningfully
+            # better rate. MIN_HOLD_PERIODS prevents churning before breakeven.
+            if config.ROTATION_ENABLED and len(positions) >= config.MAX_POSITIONS:
+                worst = risk.worst_position()
+                if worst and worst.funding_periods >= config.MIN_HOLD_PERIODS:
+                    for cand in top_rates:
+                        cand_id = f"{cand.exchange}:{cand.base}"
+                        if (
+                            not cand.perp_only
+                            and cand_id not in open_ids
+                            and cand.rate_8h >= worst.last_rate_8h * config.ROTATION_THRESHOLD
+                        ):
+                            log(
+                                f"  ROTATION: {worst.id} ({worst.last_rate_8h:.4%}/8h) → "
+                                f"{cand_id} ({cand.rate_8h:.4%}/8h)"
+                            )
+                            notify.rotation(
+                                worst.base, worst.last_rate_8h,
+                                cand.base, cand.rate_8h,
+                            )
+                            close_position(
+                                worst, exchanges, risk,
+                                live=config.LIVE_TRADING, reason="rotation",
+                            )
+                            risk.save_state()
+                            positions = risk.open_positions()
+                            open_ids  = {p.id for p in positions}
+                            break  # one rotation per scan
 
             # ── Check exits on open positions ─────────────────────────────────
             for pos in positions:
@@ -304,7 +348,6 @@ def run(live: bool = False, no_ui: bool = False) -> None:
             accrue_funding(positions, exchanges, risk)
 
             # ── Open new positions ────────────────────────────────────────────
-            open_ids = {p.id for p in positions}
             for rate in top_rates:
                 if rate.rate_8h < config.MIN_FUNDING_RATE:
                     break  # sorted descending
@@ -325,6 +368,18 @@ def run(live: bool = False, no_ui: bool = False) -> None:
                     f"  Earned today: ${daily:.4f} / ${config.TARGET_DAILY_USDC:.0f} target  "
                     f"| All-time: ${total:.4f}  | Position size: ${eff:.0f}"
                 )
+
+            # ── Daily summary (midnight UTC) ──────────────────────────────────
+            today = datetime.now(timezone.utc).date()
+            if today != _summary_date:
+                stats = risk.get_stats()
+                notify.daily_summary(
+                    earned_today   = risk.daily_earned(),
+                    total_earned   = stats["total_funding_earned"],
+                    open_positions = stats["open_positions"],
+                    target         = config.TARGET_DAILY_USDC,
+                )
+                _summary_date = today
 
             time.sleep(config.SCAN_INTERVAL)
 

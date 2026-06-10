@@ -183,6 +183,41 @@ def render(
         rate_table if top_rates else Text("  (scanning…)", style="dim")
     )
 
+    # ── Cross-exchange comparison (same base, all exchanges) ─────────────────
+    # Group top_rates by base, show best rate per exchange for each asset.
+    from collections import defaultdict
+    base_map: dict[str, list] = defaultdict(list)
+    for r in top_rates[:30]:
+        base_map[r.base].append(r)
+    # Keep only bases that appear on 2+ exchanges
+    multi = {b: sorted(rs, key=lambda x: x.rate_8h, reverse=True)
+             for b, rs in base_map.items() if len(rs) >= 2}
+
+    if multi:
+        cmp_table = Table(show_header=True, header_style="bold dim", box=None, padding=(0, 1))
+        cmp_table.add_column("Asset",   width=7)
+        cmp_table.add_column("Best",    width=11)
+        cmp_table.add_column("Rate",    width=9, justify="right")
+        cmp_table.add_column("2nd",     width=11)
+        cmp_table.add_column("Rate",    width=9, justify="right")
+        cmp_table.add_column("Spread",  width=8, justify="right")
+        for base, rs in list(multi.items())[:6]:
+            best = rs[0]
+            second = rs[1]
+            spread = best.rate_8h - second.rate_8h
+            sp_color = "green" if spread > 0.0005 else "white"
+            cmp_table.add_row(
+                base,
+                best.exchange,
+                f"{best.rate_8h:.4%}",
+                second.exchange,
+                f"{second.rate_8h:.4%}",
+                f"[{sp_color}]+{spread:.4%}[/{sp_color}]",
+            )
+        grid.add_row(_DIV)
+        grid.add_row(Text("CROSS-EXCHANGE (same asset, best vs 2nd)", style="bold dim"))
+        grid.add_row(cmp_table)
+
     return Panel(
         grid,
         title="[bold cyan]Funding Rate Arbitrage[/bold cyan]",

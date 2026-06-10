@@ -185,6 +185,16 @@ class RiskManager:
                     f"Capital cap: ${deployed:.0f} + ${size:.0f} "
                     f"> ${config.MAX_TOTAL_USDC:.0f}"
                 )
+            max_per_ex = config.MAX_TOTAL_USDC * config.MAX_EXCHANGE_FRACTION
+            ex_deployed = sum(
+                p.size_usdc for p in self._positions.values()
+                if p.exchange == exchange
+            )
+            if ex_deployed + size > max_per_ex:
+                return False, (
+                    f"Exchange cap: ${ex_deployed:.0f} on {exchange} "
+                    f"+ ${size:.0f} > ${max_per_ex:.0f} (50% limit)"
+                )
             return True, "OK"
 
     def should_exit(
@@ -286,6 +296,21 @@ class RiskManager:
                 "compound_threshold":      threshold,
                 "recent_spikes":           list(self._recent_spikes[-3:]),
             }
+
+    def worst_position(self) -> Optional[Position]:
+        """Return the open position with the lowest current funding rate."""
+        with self._lock:
+            if not self._positions:
+                return None
+            return min(self._positions.values(), key=lambda p: p.last_rate_8h)
+
+    def exchange_deployed(self, exchange: str) -> float:
+        """Total USDC deployed on a specific exchange."""
+        with self._lock:
+            return sum(
+                p.size_usdc for p in self._positions.values()
+                if p.exchange == exchange
+            )
 
     # ── State persistence ─────────────────────────────────────────────────────
 
