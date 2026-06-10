@@ -76,6 +76,34 @@ MAX_BREAKEVEN_PERIODS = int(os.getenv("MAX_BREAKEVEN_PERIODS", "12"))
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# ── Rate stability filter ─────────────────────────────────────────────────────
+# Only enter a position if the rate has been above MIN_FUNDING_RATE for this
+# many consecutive scans. Prevents entering on 1-scan transient spikes.
+RATE_STABILITY_ENABLED = os.getenv("RATE_STABILITY_ENABLED", "true").lower() == "true"
+RATE_STABILITY_SCANS   = int(os.getenv("RATE_STABILITY_SCANS", "3"))
+
+# ── Hedge drift monitor ───────────────────────────────────────────────────────
+# The spot-perp hedge becomes imperfect as price moves from entry.
+# Alert at HEDGE_DRIFT_ALERT_PCT; auto-exit at HEDGE_DRIFT_EXIT_PCT.
+HEDGE_DRIFT_ALERT_PCT = float(os.getenv("HEDGE_DRIFT_ALERT_PCT", "0.05"))   # 5%
+HEDGE_DRIFT_EXIT_PCT  = float(os.getenv("HEDGE_DRIFT_EXIT_PCT",  "0.15"))   # 15%
+
+# ── Circuit breaker ───────────────────────────────────────────────────────────
+# If CIRCUIT_BREAKER_EXITS or more positions exit due to rate flips within
+# 1 hour, pause new entries until the regime stabilises.
+CIRCUIT_BREAKER_ENABLED = os.getenv("CIRCUIT_BREAKER_ENABLED", "true").lower() == "true"
+CIRCUIT_BREAKER_EXITS   = int(os.getenv("CIRCUIT_BREAKER_EXITS", "3"))
+
+# ── Trade journal ─────────────────────────────────────────────────────────────
+# CSV file where every closed position is logged for performance tracking.
+TRADE_JOURNAL_FILE = os.getenv("TRADE_JOURNAL_FILE", "./funding_arb_trades.csv")
+
+# ── Adaptive scan speed ───────────────────────────────────────────────────────
+# Scan faster when below FAST_SCAN_THRESHOLD utilisation to capture
+# opportunities sooner.
+SCAN_INTERVAL_FAST  = int(os.getenv("SCAN_INTERVAL_FAST",  "30"))
+FAST_SCAN_THRESHOLD = float(os.getenv("FAST_SCAN_THRESHOLD", "0.5"))
+
 # ── Annualised equivalents (3 × 365 = 1095 periods per year) ─────────────────
 PERIODS_PER_YEAR = 3 * 365
 

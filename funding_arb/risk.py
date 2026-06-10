@@ -17,7 +17,8 @@ from __future__ import annotations
 import json
 import os
 import threading
-from datetime import datetime, date, timezone
+from collections import deque
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 
 import config
@@ -96,6 +97,12 @@ class RiskManager:
         self._recent_spikes: list[RateSpike] = []
         self._spike_seen: set[str] = set()
 
+        # Rate stability tracking: rolling window of recent rate observations
+        self._rate_history: dict[str, deque] = {}
+
+        # Circuit breaker: timestamps of exits caused by rate flips
+        self._flip_exit_times: list[datetime] = []
+
     # ── Daily reset ───────────────────────────────────────────────────────────
 
     def _maybe_reset_daily(self) -> None:
@@ -166,6 +173,46 @@ class RiskManager:
                         self._recent_spikes = self._recent_spikes[-10:]
                         new.append(spike)
         return new
+
+    # ── Rate stability ────────────────────────────────────────────────────────
+
+    def record_rate_observation(self, exchange: str, base: str, rate: float) -> None:
+        """Store the latest rate reading for the stability filter."""
+        with self._lock:
+            key = f"{exchange}:{base}"
+            if key not in self._rate_history:
+                window = max(config.RATE_STABILITY_SCANS + 1, 2)
+                self._rate_history[key] = deque(maxlen=window)
+            self._rate_history[key].append(rate)
+
+    def is_rate_stable(self, exchange: str, base: str) -> bool:
+        """True if the last RATE_STABILITY_SCANS observations were all above MIN_FUNDING_RATE."""
+        if not config.RATE_STABILITY_ENABLED:
+            return True
+        with self._lock:
+            hist = self._rate_history.get(f"{exchange}:{base}")
+            if not hist or len(hist) < config.RATE_STABILITY_SCANS:
+                return False
+            return all(r >= config.MIN_FUNDING_RATE for r in list(hist)[-config.RATE_STABILITY_SCANS:])
+
+    # ── Circuit breaker ───────────────────────────────────────────────────────
+
+    def record_flip_exit(self) -> None:
+        """Call when a position exits because its rate went negative or below threshold."""
+        with self._lock:
+            now = _utcnow()
+            self._flip_exit_times.append(now)
+            cutoff = now - timedelta(hours=1)
+            self._flip_exit_times = [t for t in self._flip_exit_times if t > cutoff]
+
+    def circuit_breaker_open(self) -> bool:
+        """True if too many rate-flip exits happened in the last hour."""
+        if not config.CIRCUIT_BREAKER_ENABLED:
+            return False
+        with self._lock:
+            cutoff = _utcnow() - timedelta(hours=1)
+            recent = sum(1 for t in self._flip_exit_times if t > cutoff)
+            return recent >= config.CIRCUIT_BREAKER_EXITS
 
     # ── Gate ──────────────────────────────────────────────────────────────────
 

@@ -68,6 +68,22 @@ def spike_alert(exchange: str, base: str, rate_8h: float, apy: float) -> None:
     )
 
 
+def hedge_drift_alert(exchange: str, base: str, drift_pct: float) -> None:
+    _send(
+        f"⚠️ <b>HEDGE DRIFT</b>  {exchange.upper()} {base}\n"
+        f"Price has moved {drift_pct:.1%} from entry — delta-neutral hedge is drifting.\n"
+        f"Auto-exit triggers at {config.HEDGE_DRIFT_EXIT_PCT:.0%}."
+    )
+
+
+def circuit_breaker_alert(exits_in_hour: int) -> None:
+    _send(
+        f"🚨 <b>CIRCUIT BREAKER OPEN</b>\n"
+        f"{exits_in_hour} positions exited due to rate flips in the last hour.\n"
+        f"New entries paused until regime stabilises."
+    )
+
+
 def daily_summary(
     earned_today: float, total_earned: float, open_positions: int, target: float
 ) -> None:

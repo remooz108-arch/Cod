@@ -32,6 +32,8 @@ Usage
 from __future__ import annotations
 
 import argparse
+import csv
+import os
 import time
 from datetime import datetime, timezone
 
@@ -60,6 +62,71 @@ def ts() -> str:
 
 def log(msg: str) -> None:
     print(f"[{ts()}] {msg}")
+
+
+# ── Trade journal ────────────────────────────────────────────────────────────
+
+def _log_trade(pos: "Position", reason: str) -> None:
+    """Append one closed trade to the CSV journal for performance tracking."""
+    path = config.TRADE_JOURNAL_FILE
+    write_header = not os.path.exists(path)
+    try:
+        with open(path, "a", newline="") as fh:
+            w = csv.writer(fh)
+            if write_header:
+                w.writerow([
+                    "closed_at", "exchange", "base", "size_usdc",
+                    "periods", "funding_collected", "apy_realised_pct",
+                    "opened_at", "duration_hours", "reason",
+                ])
+            now   = datetime.now(timezone.utc)
+            hours = (
+                (now - pos.opened_at).total_seconds() / 3600
+                if pos.opened_at else ""
+            )
+            w.writerow([
+                now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                pos.exchange, pos.base, f"{pos.size_usdc:.2f}",
+                pos.funding_periods,
+                f"{pos.funding_collected:.6f}",
+                f"{pos.apy_realised:.2f}" if pos.funding_periods > 0 else "n/a",
+                pos.opened_at.strftime("%Y-%m-%d %H:%M:%S UTC") if pos.opened_at else "",
+                f"{hours:.1f}" if hours != "" else "",
+                reason,
+            ])
+    except Exception as exc:
+        log(f"  [warn] trade journal write failed: {exc}")
+
+
+# ── Hedge drift check ─────────────────────────────────────────────────────────
+
+def check_hedge_drift(
+    positions: list, exchanges: dict, risk: "RiskManager", live: bool
+) -> None:
+    """Alert or exit when spot price has drifted too far from the entry price."""
+    for pos in positions:
+        ex = exchanges.get(pos.exchange)
+        if not ex or not pos.entry_perp_price:
+            continue
+        try:
+            ticker  = ex.fetch_ticker(pos.perp_symbol)
+            current = ticker.get("last") or ticker.get("markPrice") or ticker.get("mark")
+            if not current:
+                continue
+            drift = abs(float(current) - pos.entry_perp_price) / pos.entry_perp_price
+            if drift >= config.HEDGE_DRIFT_EXIT_PCT:
+                reason = (
+                    f"Hedge drift {drift:.1%} "
+                    f"(entry ${pos.entry_perp_price:.4f} → ${float(current):.4f})"
+                )
+                log(f"  EXIT {pos.id} — {reason}")
+                close_position(pos, exchanges, risk, live=live, reason=reason)
+                risk.save_state()
+            elif drift >= config.HEDGE_DRIFT_ALERT_PCT:
+                log(f"  ⚠️  HEDGE DRIFT {pos.id}: {drift:.1%} from entry")
+                notify.hedge_drift_alert(pos.exchange, pos.base, drift)
+        except Exception:
+            pass
 
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
@@ -93,6 +160,11 @@ def open_position(
     if rate.rate_8h > 0 and (round_trip_cost / rate.rate_8h) > config.MAX_BREAKEVEN_PERIODS:
         log(f"  Skip {ex_name}:{rate.base} — breakeven "
             f"{round_trip_cost/rate.rate_8h:.1f} periods > {config.MAX_BREAKEVEN_PERIODS} max")
+        return
+
+    # Rate stability filter: require the rate to have been good for N consecutive scans.
+    if not risk.is_rate_stable(ex_name, rate.base):
+        log(f"  Skip {ex_name}:{rate.base} — awaiting {config.RATE_STABILITY_SCANS} stable scans")
         return
 
     half         = pos_size / 2
@@ -191,6 +263,11 @@ def close_position(
     risk.record_close(pos.id)
     log(f"  Position closed. Funding collected: ${pos.funding_collected:.4f}")
     notify.position_closed(pos.exchange, pos.base, reason, pos.funding_collected)
+    _log_trade(pos, reason)
+
+    # Circuit breaker: count rate-flip exits (not rotations or drift exits).
+    if "rate" in reason.lower() or "negative" in reason.lower() or "below" in reason.lower():
+        risk.record_flip_exit()
 
 
 # ── Funding accrual ───────────────────────────────────────────────────────────
@@ -263,9 +340,10 @@ def run(live: bool = False, no_ui: bool = False) -> None:
     if dashboard:
         dashboard.start()
 
-    scan_count = 0
+    scan_count    = 0
     _summary_date = datetime.now(timezone.utc).date()
     top_rates: list = []
+    _cb_notified  = False  # latch: only send circuit-breaker Telegram once per trip
 
     try:
         while True:
@@ -284,6 +362,10 @@ def run(live: bool = False, no_ui: bool = False) -> None:
 
             if dashboard:
                 dashboard.update(top_rates[:12], scan_count)
+
+            # Feed rate observations into the stability filter.
+            for r in top_rates[:60]:
+                risk.record_rate_observation(r.exchange, r.base, r.rate_8h)
 
             if no_ui and top_rates:
                 log(
@@ -347,17 +429,30 @@ def run(live: bool = False, no_ui: bool = False) -> None:
             # ── Accrue funding ────────────────────────────────────────────────
             accrue_funding(positions, exchanges, risk)
 
+            # ── Hedge drift check ─────────────────────────────────────────────
+            check_hedge_drift(positions, exchanges, risk, live=config.LIVE_TRADING)
+            # Refresh after potential drift-triggered closes.
+            positions = risk.open_positions()
+            open_ids  = {p.id for p in positions}
+
             # ── Open new positions ────────────────────────────────────────────
-            for rate in top_rates:
-                if rate.rate_8h < config.MIN_FUNDING_RATE:
-                    break  # sorted descending
-                if f"{rate.exchange}:{rate.base}" in open_ids:
-                    continue
-                open_position(
-                    rate.exchange, exchanges, rate, risk,
-                    live=config.LIVE_TRADING,
-                )
-                risk.save_state()
+            if risk.circuit_breaker_open():
+                log("  ⚡ CIRCUIT BREAKER: too many rate-flip exits — new entries paused")
+                if not _cb_notified:
+                    notify.circuit_breaker_alert(config.CIRCUIT_BREAKER_EXITS)
+                    _cb_notified = True
+            else:
+                _cb_notified = False
+                for rate in top_rates:
+                    if rate.rate_8h < config.MIN_FUNDING_RATE:
+                        break  # sorted descending
+                    if f"{rate.exchange}:{rate.base}" in open_ids:
+                        continue
+                    open_position(
+                        rate.exchange, exchanges, rate, risk,
+                        live=config.LIVE_TRADING,
+                    )
+                    risk.save_state()
 
             # ── Compound progress log ─────────────────────────────────────────
             if no_ui:
@@ -381,7 +476,14 @@ def run(live: bool = False, no_ui: bool = False) -> None:
                 )
                 _summary_date = today
 
-            time.sleep(config.SCAN_INTERVAL)
+            # Scan faster when below half capacity to catch new opportunities sooner.
+            utilisation = len(positions) / max(config.MAX_POSITIONS, 1)
+            sleep_secs  = (
+                config.SCAN_INTERVAL_FAST
+                if utilisation < config.FAST_SCAN_THRESHOLD
+                else config.SCAN_INTERVAL
+            )
+            time.sleep(sleep_secs)
 
     except KeyboardInterrupt:
         log("\nStopping…")
