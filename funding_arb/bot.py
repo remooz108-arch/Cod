@@ -47,10 +47,14 @@ from exchanges import (
     fetch_margin_ratio,
     has_spot_market,
     place_spot_buy,
+    place_spot_buy_maker,
     place_perp_short,
+    place_perp_short_maker,
     set_leverage,
     close_spot_position,
+    close_spot_position_maker,
     close_perp_position,
+    close_perp_position_maker,
     get_spot_symbol,
     PERP_ONLY_EXCHANGES,
 )
@@ -318,8 +322,22 @@ def open_position(
             f"{round_trip_cost/rate.rate_8h:.1f} periods > {config.MAX_BREAKEVEN_PERIODS} max")
         return
 
-    # Rate stability filter: require the rate to have been good for N consecutive scans.
-    if not risk.is_rate_stable(ex_name, rate.base):
+    # Funding timing gate: if payment is imminent, bypass the stability scan.
+    # Entering just before a funding settlement collects it with minimal exposure time.
+    timing_bypass = False
+    if config.TIMING_GATE_ENABLED and rate.next_funding:
+        mins_to_funding = (
+            rate.next_funding - datetime.now(timezone.utc)
+        ).total_seconds() / 60
+        if 0 < mins_to_funding <= config.TIMING_GATE_MINUTES:
+            timing_bypass = True
+            log(
+                f"  ⏰ {ex_name}:{rate.base} — funding in {mins_to_funding:.0f}m, "
+                f"timing gate active"
+            )
+
+    # Rate stability filter (bypassed when funding is imminent).
+    if not timing_bypass and not risk.is_rate_stable(ex_name, rate.base):
         log(f"  Skip {ex_name}:{rate.base} — awaiting {config.RATE_STABILITY_SCANS} stable scans")
         return
 
@@ -328,6 +346,16 @@ def open_position(
     if not consistent:
         log(f"  Skip {ex_name}:{rate.base} — {why}")
         return
+
+    # Momentum filter: skip if the rate has been declining too rapidly.
+    if config.MOMENTUM_FILTER_ENABLED:
+        momentum = risk.rate_momentum(ex_name, rate.base)
+        if momentum < config.MIN_RATE_MOMENTUM:
+            log(
+                f"  Skip {ex_name}:{rate.base} — momentum {momentum:+.0%} "
+                f"(declining, threshold {config.MIN_RATE_MOMENTUM:+.0%})"
+            )
+            return
 
     half         = pos_size / 2
     spot_symbol  = get_spot_symbol(ex_name, rate.base)
@@ -349,19 +377,28 @@ def open_position(
         # from liquidation.  Silent no-op if the exchange doesn't support it.
         set_leverage(ex, rate.symbol, config.PERP_LEVERAGE)
 
+        maker = config.MAKER_ORDER_ENABLED
         try:
-            sr          = place_spot_buy(ex, rate.base, half)
+            sr = (
+                place_spot_buy_maker(ex, rate.base, half, config.MAKER_FILL_TIMEOUT)
+                if maker else place_spot_buy(ex, rate.base, half)
+            )
             spot_order_id = sr.get("id")
             spot_qty    = float(sr.get("filled") or sr.get("amount") or spot_qty)
-            log(f"    Spot BUY  {spot_qty:.6f} {rate.base} (order {spot_order_id})")
+            log(f"    Spot BUY  {spot_qty:.6f} {rate.base} "
+                f"(order {spot_order_id}){' [maker]' if maker else ''}")
         except Exception as exc:
             log(f"    ERROR spot buy: {exc}")
             return
 
         try:
-            pr            = place_perp_short(ex, rate.symbol, half)
+            pr = (
+                place_perp_short_maker(ex, rate.symbol, half, config.MAKER_FILL_TIMEOUT)
+                if maker else place_perp_short(ex, rate.symbol, half)
+            )
             perp_order_id = pr.get("id")
-            log(f"    Perp SHORT filled: {perp_order_id}")
+            log(f"    Perp SHORT filled: {perp_order_id}"
+                f"{' [maker]' if maker else ''}")
         except Exception as exc:
             log(f"    ERROR perp short (spot leg already open!): {exc}")
             log(f"    CRITICAL: Unhedged {rate.base} spot on {ex_name} — close manually.")
@@ -374,11 +411,14 @@ def open_position(
 
     # Capture the full entry thesis for the trade journal (why we entered).
     mean, std, n  = risk.rate_stats(ex_name, rate.base)
+    momentum      = risk.rate_momentum(ex_name, rate.base)
     breakeven_p   = (round_trip_cost / rate.rate_8h) if rate.rate_8h > 0 else 0
     entry_note = (
         f"rate {rate.rate_8h:.4%}/8h ({rate.apy:.0f}% APY); "
         f"avg {mean:.4%} over {n} scans; "
+        f"momentum {momentum:+.0%}; "
         f"breakeven {breakeven_p:.1f}p; size ${pos_size:.2f}"
+        + ("; timing-gate" if timing_bypass else "")
     )
 
     pos = Position(
@@ -408,7 +448,8 @@ def open_position(
 # ── Exit ──────────────────────────────────────────────────────────────────────
 
 def close_position(
-    pos: Position, exchanges: dict, risk: RiskManager, live: bool, reason: str
+    pos: Position, exchanges: dict, risk: RiskManager, live: bool, reason: str,
+    use_maker: bool = False,
 ) -> None:
     log(f"  EXITING {pos.id} — {reason}")
     spot_ex = exchanges.get(pos.spot_exchange)
@@ -423,15 +464,26 @@ def close_position(
                 f"Position remains open. Check your API keys.")
             return
 
+        maker = use_maker and config.MAKER_ORDER_ENABLED
         try:
-            close_spot_position(spot_ex, pos.base, pos.spot_qty)
-            log(f"    Spot SELL {pos.spot_qty:.6f} {pos.base} done")
+            if maker:
+                close_spot_position_maker(spot_ex, pos.base, pos.spot_qty,
+                                          config.MAKER_FILL_TIMEOUT)
+            else:
+                close_spot_position(spot_ex, pos.base, pos.spot_qty)
+            log(f"    Spot SELL {pos.spot_qty:.6f} {pos.base} done"
+                f"{' (maker)' if maker else ''}")
         except Exception as exc:
             log(f"    ERROR closing spot: {exc}")
 
         try:
-            close_perp_position(perp_ex, pos.perp_symbol, pos.perp_qty)
-            log(f"    Perp BUY-BACK {pos.perp_qty:.6f} done")
+            if maker:
+                close_perp_position_maker(perp_ex, pos.perp_symbol, pos.perp_qty,
+                                          config.MAKER_FILL_TIMEOUT)
+            else:
+                close_perp_position(perp_ex, pos.perp_symbol, pos.perp_qty)
+            log(f"    Perp BUY-BACK {pos.perp_qty:.6f} done"
+                f"{' (maker)' if maker else ''}")
         except Exception as exc:
             log(f"    ERROR closing perp: {exc}")
     else:
@@ -597,6 +649,7 @@ def run(live: bool = False, no_ui: bool = False) -> None:
                             close_position(
                                 worst, exchanges, risk,
                                 live=config.LIVE_TRADING, reason="rotation",
+                                use_maker=True,
                             )
                             risk.save_state()
                             positions = risk.open_positions()
@@ -609,9 +662,12 @@ def run(live: bool = False, no_ui: bool = False) -> None:
                 current_rate = fetch_current_funding_rate(ex, pos.perp_symbol) if ex else None
                 should, reason = risk.should_exit(pos, current_rate)
                 if should:
+                    # Soft exits (rate decay) can use maker; hard exits (negative) market.
+                    soft = "below exit" in reason or "Trailing" in reason
                     close_position(
                         pos, exchanges, risk,
                         live=config.LIVE_TRADING, reason=reason,
+                        use_maker=soft,
                     )
                     risk.save_state()
 

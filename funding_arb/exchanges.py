@@ -270,6 +270,109 @@ def set_leverage(ex: Any, symbol: str, leverage: int) -> None:
         pass  # Not all exchanges require or support explicit leverage setting
 
 
+# ── Maker-order helpers ───────────────────────────────────────────────────────
+
+def _await_fill(ex: Any, order_id: str, symbol: str, fill_timeout: int) -> Optional[dict]:
+    """Poll until an order is filled or the timeout expires. Returns filled order or None."""
+    deadline = time.time() + fill_timeout
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            o = ex.fetch_order(order_id, symbol)
+        except Exception:
+            return None
+        status = o.get("status", "")
+        if status == "closed":
+            return o
+        if status in ("canceled", "rejected", "expired"):
+            return None
+    try:
+        ex.cancel_order(order_id, symbol)
+    except Exception:
+        pass
+    return None
+
+
+def place_spot_buy_maker(ex: Any, base: str, usdc_amount: float, fill_timeout: int = 20) -> dict:
+    """Post-only limit buy at best bid; falls back to market if not filled in time."""
+    symbol = get_spot_symbol(ex.id, base)
+    try:
+        book  = ex.fetch_order_book(symbol, limit=5)
+        bids  = book.get("bids", [])
+        if bids:
+            price = float(bids[0][0])
+            qty   = float(ex.amount_to_precision(symbol, usdc_amount / price))
+            order = ex.create_limit_buy_order(
+                symbol, qty, price, params={"postOnly": True}
+            )
+            result = _await_fill(ex, order["id"], symbol, fill_timeout)
+            if result:
+                return result
+    except Exception:
+        pass
+    return place_spot_buy(ex, base, usdc_amount)
+
+
+def place_perp_short_maker(ex: Any, perp_symbol: str, usdc_amount: float, fill_timeout: int = 20) -> dict:
+    """Post-only limit short at best ask; falls back to market if not filled in time."""
+    try:
+        book  = ex.fetch_order_book(perp_symbol, limit=5)
+        asks  = book.get("asks", [])
+        if asks:
+            price = float(asks[0][0])
+            qty   = float(ex.amount_to_precision(perp_symbol, usdc_amount / price))
+            order = ex.create_limit_sell_order(
+                perp_symbol, qty, price,
+                params={"postOnly": True, "reduceOnly": False},
+            )
+            result = _await_fill(ex, order["id"], perp_symbol, fill_timeout)
+            if result:
+                return result
+    except Exception:
+        pass
+    return place_perp_short(ex, perp_symbol, usdc_amount)
+
+
+def close_spot_position_maker(ex: Any, base: str, qty: float, fill_timeout: int = 15) -> dict:
+    """Post-only limit sell to close spot; falls back to market if not filled in time."""
+    symbol = get_spot_symbol(ex.id, base)
+    try:
+        book  = ex.fetch_order_book(symbol, limit=5)
+        asks  = book.get("asks", [])
+        if asks:
+            price   = float(asks[0][0])
+            qty_str = float(ex.amount_to_precision(symbol, qty))
+            order   = ex.create_limit_sell_order(
+                symbol, qty_str, price, params={"postOnly": True}
+            )
+            result = _await_fill(ex, order["id"], symbol, fill_timeout)
+            if result:
+                return result
+    except Exception:
+        pass
+    return close_spot_position(ex, base, qty)
+
+
+def close_perp_position_maker(ex: Any, perp_symbol: str, qty: float, fill_timeout: int = 15) -> dict:
+    """Post-only limit buy-back to close perp; falls back to market if not filled in time."""
+    try:
+        book  = ex.fetch_order_book(perp_symbol, limit=5)
+        bids  = book.get("bids", [])
+        if bids:
+            price   = float(bids[0][0])
+            qty_str = float(ex.amount_to_precision(perp_symbol, qty))
+            order   = ex.create_limit_buy_order(
+                perp_symbol, qty_str, price,
+                params={"postOnly": True, "reduceOnly": True},
+            )
+            result = _await_fill(ex, order["id"], perp_symbol, fill_timeout)
+            if result:
+                return result
+    except Exception:
+        pass
+    return close_perp_position(ex, perp_symbol, qty)
+
+
 def fetch_margin_ratio(ex: Any, symbol: str) -> Optional[float]:
     """
     Return the margin health ratio for a short position on `symbol`.

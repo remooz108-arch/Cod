@@ -137,6 +137,37 @@ TRADE_JOURNAL_FILE = os.getenv("TRADE_JOURNAL_FILE", "./funding_arb_trades.csv")
 SCAN_INTERVAL_FAST  = int(os.getenv("SCAN_INTERVAL_FAST",  "30"))
 FAST_SCAN_THRESHOLD = float(os.getenv("FAST_SCAN_THRESHOLD", "0.5"))
 
+# ── Maker-order entry ─────────────────────────────────────────────────────────
+# Post-only limit at best bid/ask; falls back to market if not filled in time.
+# Saves ~0.03–0.05 % per round trip on Bybit/OKX (taker avoided, rebate earned).
+MAKER_ORDER_ENABLED = os.getenv("MAKER_ORDER_ENABLED", "true").lower() == "true"
+MAKER_FILL_TIMEOUT  = int(os.getenv("MAKER_FILL_TIMEOUT", "20"))   # seconds
+
+# ── Sector concentration cap ──────────────────────────────────────────────────
+# No more than MAX_SECTOR_POSITIONS open at once from the same narrative cluster.
+# Prevents 4 memecoins or 3 L1s exiting simultaneously in a sentiment reversal.
+MAX_SECTOR_POSITIONS = int(os.getenv("MAX_SECTOR_POSITIONS", "2"))
+SECTOR_CLUSTERS: dict[str, set[str]] = {
+    "l1":     {"BTC","ETH","SOL","BNB","AVAX","ADA","DOT","MATIC","NEAR","APT","SUI","SEI","TON"},
+    "meme":   {"DOGE","SHIB","PEPE","WIF","BONK","FLOKI","NEIRO","MEME","POPCAT","BOME","TURBO","MOG"},
+    "defi":   {"UNI","AAVE","CRV","MKR","SNX","SUSHI","COMP","1INCH","JUP","ORCA","PENDLE","CAKE"},
+    "ai":     {"FET","AGIX","OCEAN","RNDR","WLD","TAO","ARKM","GRT","AIOZ"},
+    "gaming": {"AXS","MANA","SAND","ENJ","GALA","IMX","RON","BEAM","PIXEL","MAGIC","YGG"},
+}
+
+# ── Funding timing gate ───────────────────────────────────────────────────────
+# When next_funding is known and < TIMING_GATE_MINUTES away, bypass the
+# rate-stability scan — the payment is imminent, collect it immediately.
+TIMING_GATE_ENABLED = os.getenv("TIMING_GATE_ENABLED", "true").lower() == "true"
+TIMING_GATE_MINUTES = int(os.getenv("TIMING_GATE_MINUTES", "15"))
+
+# ── Rate momentum filter ──────────────────────────────────────────────────────
+# Reject entries where the rate has been falling too fast.
+# Momentum = (last_rate - first_rate) / first_rate over the observation window.
+# -0.3 means "skip if rate has fallen more than 30% of its own value."
+MOMENTUM_FILTER_ENABLED = os.getenv("MOMENTUM_FILTER_ENABLED", "true").lower() == "true"
+MIN_RATE_MOMENTUM       = float(os.getenv("MIN_RATE_MOMENTUM", "-0.3"))
+
 # ── Telegram notifications ────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")

@@ -110,6 +110,13 @@ class RiskManager:
         # Cooldown guard: {exchange:base -> datetime re-entry is allowed again}
         self._cooldowns: dict[str, datetime] = {}
 
+        # Sector map for concentration checks (built once from config at init)
+        self._sector_map: dict[str, str] = {
+            base: sector
+            for sector, bases in config.SECTOR_CLUSTERS.items()
+            for base in bases
+        }
+
     # ── Daily reset ───────────────────────────────────────────────────────────
 
     def _maybe_reset_daily(self) -> None:
@@ -233,6 +240,22 @@ class RiskManager:
             return False, f"volatile (CV {cv:.2f} > {config.MAX_RATE_CV:.2f})"
         return True, "OK"
 
+    def rate_momentum(self, exchange: str, base: str) -> float:
+        """
+        Normalised rate change across the observation window.
+        Returns (last − first) / first, clamped to [-1, +∞).
+        0.0 when insufficient data. Positive = rising, negative = falling.
+        """
+        with self._lock:
+            hist = self._rate_history.get(f"{exchange}:{base}")
+            if not hist or len(hist) < 3:
+                return 0.0
+            data  = list(hist)
+            first = data[0]
+            if first <= 0:
+                return 0.0
+            return (data[-1] - first) / first
+
     # ── Cooldown guard ────────────────────────────────────────────────────────
 
     def start_cooldown(self, exchange: str, base: str) -> None:
@@ -319,6 +342,19 @@ class RiskManager:
                     f"+ ${size:.0f} > ${max_per_asset:.0f} "
                     f"({config.MAX_ASSET_FRACTION:.0%} limit)"
                 )
+            # Sector cap: cap exposure to any one narrative cluster.
+            if config.MAX_SECTOR_POSITIONS > 0:
+                sector = self._sector_map.get(base)
+                if sector:
+                    sc = sum(
+                        1 for p in self._positions.values()
+                        if self._sector_map.get(p.base) == sector
+                    )
+                    if sc >= config.MAX_SECTOR_POSITIONS:
+                        return False, (
+                            f"Sector cap: {sc}/{config.MAX_SECTOR_POSITIONS} "
+                            f"positions already in '{sector}' cluster"
+                        )
             return True, "OK"
 
     def should_exit(
