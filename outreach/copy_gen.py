@@ -1,8 +1,8 @@
 """
-Generate personalized cold email openers using the Claude API.
+Generate personalised cold email openers using the Claude API.
 
-Each opener is 1-2 sentences, hyper-specific to the business and its pain signal.
-We use claude-haiku-4-5 for speed and cost efficiency at scale.
+One opener per lead — 1-2 sentences, specific to their visible pain signal.
+Uses claude-haiku-4-5 for speed and cost at scale.
 """
 
 import os
@@ -24,58 +24,68 @@ def generate_opener(
     company_name: str,
     vertical_label: str,
     pain_signals: list[str],
+    primary_pain: str,
     city: str = "",
     website: str = "",
 ) -> str:
     """
     Return a 1-2 sentence personalised opening line for a cold email.
 
-    The opener should:
-    - Reference something specific about their business (pain signal)
-    - Sound like it came from a human who actually looked at their site
-    - NOT mention AI, software, or the offer (that comes later in the email)
+    primary_pain: "web" | "workflow" | "both"
     """
     location_str = f" in {city}" if city else ""
-    pain_str = (
-        ", ".join(pain_signals)
-        if pain_signals
-        else "likely handling all customer contact manually"
-    )
-    website_str = f" (website: {website})" if website else ""
+    pain_str = ", ".join(pain_signals) if pain_signals else "likely handling most admin manually"
+    website_str = f" — site: {website}" if website else " — no website found"
+
+    if primary_pain == "web":
+        angle = (
+            "Focus on their website issues. Sound like someone who briefly looked at "
+            "their site (or noticed they don't have one). Don't mention the word 'website' "
+            "directly — reference the customer experience instead."
+        )
+    elif primary_pain == "workflow":
+        angle = (
+            "Focus on the operational/admin side — they're probably handling lead follow-up, "
+            "scheduling, or customer communication manually. Sound like someone who's seen "
+            "this pattern with similar businesses."
+        )
+    else:
+        angle = (
+            "They have both a weak web presence and manual workflows. Lead with whichever "
+            "would be most immediately painful for a business owner."
+        )
 
     prompt = (
-        f"Write a 1-2 sentence cold email opening line for a small business owner.\n\n"
-        f"Business: {company_name}{location_str} — a {vertical_label}{website_str}\n"
-        f"Pain signals observed: {pain_str}\n"
-        f"Recipient first name: {first_name}\n\n"
+        f"Write a 1-2 sentence cold email opening line.\n\n"
+        f"Business: {company_name}{location_str} — {vertical_label}{website_str}\n"
+        f"Observed pain signals: {pain_str}\n"
+        f"Angle: {angle}\n\n"
         f"Rules:\n"
-        f"- Sound like a human who spent 2 minutes on their website or Google listing\n"
-        f"- Reference the specific pain signal naturally (don't say 'I noticed you have no booking system')\n"
-        f"- Do NOT mention AI, software, automation, or any offer\n"
-        f"- Do NOT use hollow phrases like 'I came across your business' or 'I hope this finds you well'\n"
-        f"- Keep it under 40 words\n"
-        f"- Output only the opener text, no quotes, no extra commentary"
+        f"- Sound like a human who spent 2 minutes on their Google listing or website\n"
+        f"- Reference the specific pain naturally — don't quote the signals verbatim\n"
+        f"- Do NOT mention your company, product, price, or any offer\n"
+        f"- Do NOT use filler phrases like 'I came across your business' or 'I hope this finds you well'\n"
+        f"- Under 35 words\n"
+        f"- Output only the opener, no quotes, no extra text"
     )
 
     resp = _get_client().messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=120,
+        max_tokens=100,
         messages=[{"role": "user", "content": prompt}],
     )
     return resp.content[0].text.strip()
 
 
 def generate_openers_batch(leads: list[dict], vertical_label: str) -> list[dict]:
-    """
-    Add an 'opener' field to each lead dict. Processes sequentially to avoid
-    rate-limit bursts; fast enough for batches up to ~200 leads.
-    """
+    """Add an 'opener' field to each lead dict."""
     for lead in leads:
         lead["opener"] = generate_opener(
             first_name=lead.get("first_name", "there"),
             company_name=lead.get("company_name", "your business"),
             vertical_label=vertical_label,
             pain_signals=lead.get("pain_signals", []),
+            primary_pain=lead.get("primary_pain", "web"),
             city=lead.get("city", ""),
             website=lead.get("website", ""),
         )
