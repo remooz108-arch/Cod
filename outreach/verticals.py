@@ -55,7 +55,7 @@ SEQUENCE_STEPS = [
             "{{opener}}\n\n"
             "We build and fully maintain websites for {{vertical_label}} businesses — "
             "$100/mo, includes hosting, all maintenance, and 3 edits a month. "
-            "Most clients are live within a week.\n\n"
+            "Most clients are live within 3 days.\n\n"
             "Worth a quick 15-minute call?\n\n"
             "{{sender_name}}\n"
             "buildanewsite.com"
