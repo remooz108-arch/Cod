@@ -66,6 +66,7 @@ from models import Position
 from risk import RiskManager
 from dashboard import Dashboard
 import notify
+import paper
 
 
 def ts() -> str:
@@ -193,6 +194,8 @@ def check_margin_health(
         elif ratio >= config.MARGIN_ALERT_RATIO:
             log(f"  ⚠️  MARGIN WARNING {pos.id}: ratio={ratio:.2f}")
             notify.margin_alert(pos.exchange, pos.base, ratio, "warning")
+            if config.PAPER_TRADING:
+                paper.get_ledger().record_liquidation_risk(pos.id, ratio)
 
 
 # ── Performance report ────────────────────────────────────────────────────────
@@ -471,6 +474,8 @@ def open_position(
         perp_order_id=perp_order_id,
     )
     risk.record_open(pos)
+    if config.PAPER_TRADING:
+        paper.get_ledger().record_open(pos)
     log(f"  Position opened: {pos.id}  (${pos_size:.0f} USDC deployed)")
     notify.position_opened(ex_name, rate.base, pos_size, rate.rate_8h, rate.apy)
 
@@ -582,6 +587,8 @@ def open_inverse_position(
         direction="short",
     )
     risk.record_open(pos)
+    if config.PAPER_TRADING:
+        paper.get_ledger().record_open(pos)
     log(f"  Inverse position opened: {pos.id}  (${pos_size:.0f} USDC deployed)")
     notify.position_opened(ex_name, rate.base, pos_size, rate.rate_8h, abs(rate.apy))
 
@@ -637,6 +644,8 @@ def close_position(
         log(f"    [dry-run] Would close spot + perp for {pos.id}")
 
     risk.record_close(pos.id)
+    if config.PAPER_TRADING:
+        paper.get_ledger().record_close(pos, reason)
     log(f"  Position closed. Funding collected: ${pos.funding_collected:.4f}")
     notify.position_closed(pos.exchange, pos.base, reason, pos.funding_collected)
     _log_trade(pos, reason)
@@ -679,6 +688,8 @@ def accrue_funding(
             # the best estimate without an extra balance API call.
             amount = abs(rate) * (pos.size_usdc / 2)
             risk.record_funding(pos.id, amount, rate, period_at=now)
+            if config.PAPER_TRADING:
+                paper.get_ledger().record_funding(pos.id, amount, pos.direction)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -687,7 +698,14 @@ def run(live: bool = False, no_ui: bool = False) -> None:
     if live:
         config.LIVE_TRADING = True
 
-    mode = "LIVE" if config.LIVE_TRADING else "DRY-RUN"
+    # Paper trading forces dry-run: no real orders can be placed.
+    if config.PAPER_TRADING:
+        config.LIVE_TRADING = False
+        live = False
+        ledger = paper.get_ledger()
+        print(ledger.summary())  # show any accumulated history at startup
+
+    mode = "PAPER" if config.PAPER_TRADING else ("LIVE" if config.LIVE_TRADING else "DRY-RUN")
     print(f"\n{'='*70}")
     print(f"  FUNDING RATE ARBITRAGE BOT  v2  [{mode}]")
     print(f"{'='*70}")
@@ -936,16 +954,27 @@ def run(live: bool = False, no_ui: bool = False) -> None:
               f"(pos size ${stats['effective_position_size']:.0f})")
         print(f"{'='*70}\n")
 
+        if config.PAPER_TRADING:
+            print(paper.get_ledger().summary())
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Funding rate arbitrage bot v2")
     parser.add_argument("--live",   action="store_true", help="Place real orders")
+    parser.add_argument("--paper",  action="store_true",
+                        help="Paper trade: dry-run + honest net-of-costs ledger")
     parser.add_argument("--no-ui",  action="store_true", dest="no_ui",
                         help="Log mode, no dashboard")
     parser.add_argument("--report", action="store_true",
                         help="Print P&L report from trade journal and exit")
+    parser.add_argument("--paper-report", action="store_true", dest="paper_report",
+                        help="Print the paper-trading ledger summary and exit")
     args = parser.parse_args()
-    if args.report:
+    if args.paper_report:
+        print(paper.get_ledger().summary())
+    elif args.report:
         print_performance_report()
     else:
+        if args.paper:
+            config.PAPER_TRADING = True
         run(live=args.live, no_ui=args.no_ui)

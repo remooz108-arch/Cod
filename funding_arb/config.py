@@ -57,6 +57,15 @@ EXIT_FUNDING_RATE = float(os.getenv("EXIT_FUNDING_RATE", "0.0001"))
 SCAN_INTERVAL     = int(os.getenv("SCAN_INTERVAL", "60"))
 LIVE_TRADING      = os.getenv("LIVE_TRADING", "false").lower() == "true"
 
+# ── Paper trading ─────────────────────────────────────────────────────────────
+# When true, the bot runs in dry-run (no real orders) but records an HONEST
+# net-of-costs ledger to disk so you can see what the strategy would make.
+PAPER_TRADING          = os.getenv("PAPER_TRADING", "false").lower() == "true"
+PAPER_STARTING_CAPITAL = float(os.getenv("PAPER_STARTING_CAPITAL", str(MAX_TOTAL_USDC)))
+PAPER_LEDGER_PATH      = os.getenv("PAPER_LEDGER_PATH", "./paper_ledger.json")
+# Modelled per-leg slippage on market fills (0.0003 = 0.03%).
+SIM_SLIPPAGE_PCT       = float(os.getenv("SIM_SLIPPAGE_PCT", "0.0003"))
+
 # ── State persistence ─────────────────────────────────────────────────────────
 STATE_FILE = os.getenv("STATE_FILE", "./funding_arb_state.json")
 

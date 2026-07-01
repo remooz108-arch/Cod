@@ -10,3 +10,4 @@ funding_arb_equity.csv
 
 # Secrets
 .env
+paper_ledger.json
